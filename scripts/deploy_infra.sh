@@ -57,16 +57,35 @@ done
 [[ -n "$REGION" ]] || { echo "--region is required" >&2; exit 1; }
 case "$COST_MODE" in dev-low-cost|prod-baseline) ;; *) echo "Invalid --cost-mode" >&2; exit 1;; esac
 
+log() { echo "[deploy_infra] $*"; }
+
+print_stack_failure_events() {
+  local stack_name="$1"
+  log "Stack failure details for ${stack_name}:"
+  aws cloudformation describe-stack-events --region "$REGION" --stack-name "$stack_name" \
+    --query 'StackEvents[0:10].[Timestamp,ResourceStatus,LogicalResourceId,ResourceStatusReason]' \
+    --output table || true
+}
+
+cf_deploy() {
+  local stack_name="$1"
+  shift
+  if ! aws cloudformation deploy --region "$REGION" --stack-name "$stack_name" "$@"; then
+    print_stack_failure_events "$stack_name"
+    return 1
+  fi
+}
+
 STACK_PREFIX="${PROJECT}-${ENVIRONMENT}"
 NETWORK_STACK="${STACK_PREFIX}-network"
 WAF_STACK="${STACK_PREFIX}-waf"
 APP_STACK="${STACK_PREFIX}-app"
 
+# Keep 2 AZ for ALB compatibility in all modes.
 AZ_COUNT=2
 ENABLE_WAF=true
 NAT_MODE="gateway"
 if [[ "$COST_MODE" == "dev-low-cost" ]]; then
-  AZ_COUNT=1
   ENABLE_WAF=false
   NAT_MODE="none"
 fi
@@ -75,9 +94,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CFN_DIR="$ROOT_DIR/assets/cloudformation"
 
-aws cloudformation deploy \
-  --region "$REGION" \
-  --stack-name "$NETWORK_STACK" \
+cf_deploy "$NETWORK_STACK" \
   --template-file "$CFN_DIR/network.yaml" \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
@@ -92,9 +109,7 @@ aws cloudformation deploy \
     NatMode="$NAT_MODE"
 
 if [[ "$ENABLE_WAF" == "true" ]]; then
-  aws cloudformation deploy \
-    --region "$REGION" \
-    --stack-name "$WAF_STACK" \
+  cf_deploy "$WAF_STACK" \
     --template-file "$CFN_DIR/waf.yaml" \
     --parameter-overrides \
       ProjectName="$PROJECT" \
@@ -115,9 +130,11 @@ if [[ -n "$DOMAIN_NAME" && -n "$HOSTED_ZONE_ID" ]]; then
   CERT_ARN=$(aws acm request-certificate --region "$REGION" --domain-name "$DOMAIN_NAME" --validation-method DNS --query 'CertificateArn' --output text)
 fi
 
-aws cloudformation deploy \
-  --region "$REGION" \
-  --stack-name "$APP_STACK" \
+AMI_ID=$(aws ssm get-parameter --region "$REGION" \
+  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+  --query 'Parameter.Value' --output text)
+
+cf_deploy "$APP_STACK" \
   --template-file "$CFN_DIR/app.yaml" \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
@@ -130,24 +147,25 @@ aws cloudformation deploy \
     PrivateSubnetBId="$PRIVATE_SUBNET_B" \
     AlbSecurityGroupId="$ALB_SG_ID" \
     AppSecurityGroupId="$APP_SG_ID" \
+    AmiId="$AMI_ID" \
     CertificateArn="$CERT_ARN"
 
 APP_OUTPUTS=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$APP_STACK" --query 'Stacks[0].Outputs' --output json)
 ALB_DNS=$(jq -r '.[] | select(.OutputKey=="AlbDnsName") | .OutputValue' <<<"$APP_OUTPUTS")
+ALB_ARN=$(jq -r '.[] | select(.OutputKey=="AlbArn") | .OutputValue' <<<"$APP_OUTPUTS")
 TARGET_GROUP_ARN=$(jq -r '.[] | select(.OutputKey=="TargetGroupArn") | .OutputValue' <<<"$APP_OUTPUTS")
 
 if [[ "$ENABLE_WAF" == "true" ]]; then
   WAF_OUTPUTS=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$WAF_STACK" --query 'Stacks[0].Outputs' --output json)
   WEB_ACL_ARN=$(jq -r '.[] | select(.OutputKey=="WebAclArn") | .OutputValue' <<<"$WAF_OUTPUTS")
-  LISTENER_ARN=$(jq -r '.[] | select(.OutputKey=="HttpsListenerArn") | .OutputValue' <<<"$APP_OUTPUTS")
-  aws wafv2 associate-web-acl --region "$REGION" --web-acl-arn "$WEB_ACL_ARN" --resource-arn "$LISTENER_ARN"
+  aws wafv2 associate-web-acl --region "$REGION" --web-acl-arn "$WEB_ACL_ARN" --resource-arn "$ALB_ARN"
 else
   WEB_ACL_ARN=""
 fi
 
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 jq -n \
-  --arg schemaVersion "1.0" \
+  --arg schemaVersion "1.1" \
   --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg region "$REGION" \
   --arg networkStack "$NETWORK_STACK" \
@@ -155,6 +173,7 @@ jq -n \
   --arg wafStack "$WAF_STACK" \
   --argjson wafEnabled "$ENABLE_WAF" \
   --arg albDnsName "$ALB_DNS" \
+  --arg albArn "$ALB_ARN" \
   --arg targetGroupArn "$TARGET_GROUP_ARN" \
   --arg webAclArn "$WEB_ACL_ARN" \
   '{
@@ -172,6 +191,7 @@ jq -n \
     },
     outputs: {
       albDnsName: $albDnsName,
+      albArn: $albArn,
       targetGroupArn: $targetGroupArn,
       webAclArn: (if $webAclArn == "" then null else $webAclArn end)
     }

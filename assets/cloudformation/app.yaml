@@ -14,9 +14,13 @@ Parameters:
   CertificateArn:
     Type: String
     Default: ''
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: EC2 AMI ID for OpenClaw host
 
 Conditions:
   HasCert: !Not [!Equals [!Ref CertificateArn, '']]
+  HasNoCert: !Equals [!Ref CertificateArn, '']
 
 Resources:
   AppRole:
@@ -41,7 +45,7 @@ Resources:
     Properties:
       LaunchTemplateData:
         IamInstanceProfile: { Arn: !GetAtt AppInstanceProfile.Arn }
-        ImageId: ami-0c2b8ca1dad447f8a
+        ImageId: !Ref AmiId
         InstanceType: t3.medium
         SecurityGroupIds: [!Ref AppSecurityGroupId]
         BlockDeviceMappings:
@@ -99,7 +103,7 @@ Resources:
 
   HttpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
-    Condition: !Not [!Condition HasCert]
+    Condition: HasNoCert
     Properties:
       LoadBalancerArn: !Ref Alb
       Port: 80
@@ -111,7 +115,9 @@ Resources:
 Outputs:
   AlbDnsName:
     Value: !GetAtt Alb.DNSName
+  AlbArn:
+    Value: !Ref Alb
   TargetGroupArn:
     Value: !Ref TargetGroup
-  HttpsListenerArn:
-    Value: !If [HasCert, !Ref HttpsListener, '']
+  AppInstanceId:
+    Value: !Ref AppInstance
