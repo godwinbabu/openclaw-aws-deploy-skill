@@ -1,0 +1,29 @@
+name: Deploy Dry Run Checks
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - 'assets/cloudformation/**'
+
+jobs:
+  dryrun-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure script contracts exist
+        run: |
+          test -x scripts/preflight.sh
+          test -x scripts/deploy_infra.sh
+          test -x scripts/bootstrap_host.sh
+          test -x scripts/configure_openclaw.sh
+          test -x scripts/smoke_test.sh
+          test -x scripts/collect_outputs.sh
+      - name: Validate output schemas if scripts are implemented
+        run: |
+          if grep -q 'echo "TODO: implement"' scripts/preflight.sh; then
+            echo "preflight not implemented on base branch yet; skipping execution"
+          fi
+          if [ -x scripts/plan.sh ]; then
+            ./scripts/plan.sh --region us-east-1 --environment ci --project openclaw --output /tmp/plan.json
+            test -f /tmp/plan.json && jq . /tmp/plan.json >/dev/null
+          fi
