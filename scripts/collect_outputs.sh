@@ -25,6 +25,13 @@ done
 [[ -f "$SMOKE" ]] || { echo "smoke json missing" >&2; exit 1; }
 
 jq -n --slurpfile infra "$INFRA" --slurpfile smoke "$SMOKE" \
-  '{generatedAt:(now|todate), infra:$infra[0], smoke:$smoke[0], ready: ($smoke[0].overall=="pass")}' > "$OUTPUT"
+  '{
+    schemaVersion:"1.1",
+    generatedAt:(now|todateiso8601),
+    infra:$infra[0],
+    smoke:$smoke[0],
+    ready: ($smoke[0].overall=="pass"),
+    endpoint: ($infra[0].outputs.albDnsName // null)
+  }' > "$OUTPUT"
 
 echo "Summary: $OUTPUT"
