@@ -71,6 +71,7 @@ fi
 mkdir -p "$(dirname "$OUTPUT_PATH")"
 
 jq -n \
+  --arg schemaVersion "1.1" \
   --arg generatedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg region "$REGION" \
   --arg environment "$ENVIRONMENT" \
@@ -84,9 +85,11 @@ jq -n \
   --arg wafStack "$waf_stack" \
   --arg natMode "$nat_mode" \
   --arg instanceType "$instance_type" \
+  --arg healthCheckPath "/health" \
   --argjson azCount "$az_count" \
   --argjson wafEnabled "$waf_enabled" \
   '{
+    schemaVersion: $schemaVersion,
     generatedAt: $generatedAt,
     inputs: {
       region: $region,
@@ -110,6 +113,11 @@ jq -n \
       persistence: {
         runtime: "EBS",
         backups: "Snapshots + optional S3 archive"
+      },
+      networking: {
+        albListenerPort: 443,
+        gatewayPort: 18789,
+        healthCheckPath: $healthCheckPath
       }
     }
   }' > "$OUTPUT_PATH"
