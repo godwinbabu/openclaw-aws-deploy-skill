@@ -28,3 +28,8 @@ See references:
 - `references/security-baseline.md`
 - `references/channels.md`
 - `references/model-profiles.md`
+
+
+## Infrastructure engine
+- `scripts/deploy_infra.sh` deploys CloudFormation templates in `assets/cloudformation/` (network, app, waf).
+- Deployment is idempotent via `aws cloudformation deploy`.
