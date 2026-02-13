@@ -24,6 +24,6 @@ jobs:
             echo "preflight not implemented on base branch yet; skipping execution"
           fi
           if [ -x scripts/plan.sh ]; then
-            ./scripts/plan.sh --region us-east-1 --environment ci --project openclaw --output /tmp/plan.json || true
-            test -f /tmp/plan.json && jq . /tmp/plan.json >/dev/null || true
+            ./scripts/plan.sh --region us-east-1 --environment ci --project openclaw --output /tmp/plan.json
+            test -f /tmp/plan.json && jq . /tmp/plan.json >/dev/null
           fi
