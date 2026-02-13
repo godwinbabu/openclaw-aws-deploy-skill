@@ -7,11 +7,12 @@ description: Deploy OpenClaw securely on AWS using AWS CLI and infrastructure te
 
 ## Workflow
 1. Run `scripts/preflight.sh` to validate AWS credentials, region, required CLIs, and required inputs.
-2. Run `scripts/deploy_infra.sh` to provision/update AWS infrastructure.
-3. Run `scripts/bootstrap_host.sh` to install and start OpenClaw on EC2.
-4. Run `scripts/configure_openclaw.sh` to apply model/channel config.
-5. Run `scripts/smoke_test.sh` to validate health/auth/end-to-end.
-6. Run `scripts/collect_outputs.sh` to produce deployment summary.
+2. Run `scripts/plan.sh` to generate stack names, topology choices, and deployment profile.
+3. Run `scripts/deploy_infra.sh` to provision/update AWS infrastructure.
+4. Run `scripts/bootstrap_host.sh` to install and start OpenClaw on EC2.
+5. Run `scripts/configure_openclaw.sh` to apply model/channel config.
+6. Run `scripts/smoke_test.sh` to validate health/auth/end-to-end.
+7. Run `scripts/collect_outputs.sh` to produce deployment summary.
 
 ## Safety rules
 - Never print secrets in logs.
