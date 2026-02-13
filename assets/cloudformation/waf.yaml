@@ -1,3 +1,48 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Placeholder WAF template for OpenClaw AWS deploy skill
-Resources: {}
+Description: WAF baseline for OpenClaw ALB
+
+Parameters:
+  ProjectName: { Type: String }
+  EnvironmentName: { Type: String }
+
+Resources:
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-webacl'
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${ProjectName}-${EnvironmentName}-webacl'
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: AWSManagedCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: common
+            SampledRequestsEnabled: true
+        - Name: AWSManagedKnownBadInputs
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: badinputs
+            SampledRequestsEnabled: true
+
+Outputs:
+  WebAclArn:
+    Value: !GetAtt WebAcl.Arn
