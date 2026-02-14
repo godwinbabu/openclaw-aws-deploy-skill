@@ -137,6 +137,11 @@ for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY TELEGRAM_BOT_TOKEN; do
   fi
 done
 
+# Utility functions (must be defined before first use)
+log() { echo "[$(date '+%H:%M:%S')] $*"; }
+aws_cmd() { aws --region "$REGION" --output text "$@"; }
+aws_json() { aws --region "$REGION" --output json "$@"; }
+
 # Check optional GEMINI_API_KEY
 HAS_GEMINI_KEY=false
 if [[ -n "${GEMINI_API_KEY:-}" ]]; then
@@ -165,10 +170,6 @@ SOUL_B64=$(echo "$SOUL_CONTENT" | base64)
 
 # Generate a gateway token
 GATEWAY_TOKEN=$(openssl rand -hex 32)
-
-log() { echo "[$(date '+%H:%M:%S')] $*"; }
-aws_cmd() { aws --region "$REGION" --output text "$@"; }
-aws_json() { aws --region "$REGION" --output json "$@"; }
 
 TAG_KEY="Project"
 TAG_VALUE="$NAME"
@@ -362,7 +363,8 @@ BEDROCK_POLICY=$(cat <<BPOLICY
       "Effect": "Allow",
       "Action": [
         "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream"
+        "bedrock:InvokeModelWithResponseStream",
+        "bedrock:ListFoundationModels"
       ],
       "Resource": [
         "arn:aws:bedrock:${REGION}::foundation-model/*",
@@ -622,6 +624,9 @@ export PATH="/usr/local/bin:/usr/bin:$PATH"
 export NODE_OPTIONS="--max-old-space-size=1024"
 export AWS_DEFAULT_REGION="__REGION__"
 export AWS_REGION="__REGION__"
+# CRITICAL: AWS_PROFILE=default signals to OpenClaw that AWS credentials are available
+# Without this, OpenClaw won't detect EC2 instance role credentials for Bedrock
+export AWS_PROFILE=default
 
 cd /home/openclaw/.openclaw
 
