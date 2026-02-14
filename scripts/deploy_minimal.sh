@@ -685,8 +685,12 @@ echo "[$(date)] Bootstrap complete!"
 USERDATA
 )
 
-# JSON-escape MODEL to prevent injection via quotes/backslashes
-MODEL_ESCAPED=$(printf '%s' "$MODEL" | sed 's/\\/\\\\/g; s/"/\\"/g')
+# Validate MODEL — must be a simple model string (no control chars, quotes, or newlines)
+if [[ "$MODEL" =~ [[:cntrl:]] ]] || [[ "$MODEL" == *'"'* ]] || [[ "$MODEL" == *$'\n'* ]]; then
+  echo "ERROR: --model contains invalid characters (quotes, newlines, or control chars)" >&2
+  exit 1
+fi
+MODEL_ESCAPED="$MODEL"
 
 # Replace placeholders
 USER_DATA="${USER_DATA//__NAME__/$NAME}"
