@@ -154,6 +154,12 @@ aws_json() { aws --region "$REGION" --output json "$@"; }
 TAG_KEY="Project"
 TAG_VALUE="$NAME"
 
+# Generate a unique deploy ID (timestamp-based, same across all resources)
+DEPLOY_ID="${NAME}-$(date -u +%Y%m%dT%H%M%SZ)"
+DEPLOY_TAG_KEY="DeployId"
+
+log "Deploy ID: $DEPLOY_ID"
+
 # Trap: print cleanup instructions on failure
 cleanup_on_failure() {
   local exit_code=$?
@@ -208,7 +214,7 @@ log ""
 log "--- Step 1: Creating VPC ---"
 VPC_ID=$(aws_cmd ec2 create-vpc \
   --cidr-block "$VPC_CIDR" \
-  --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${NAME}-vpc},{Key=$TAG_KEY,Value=$TAG_VALUE}]" \
+  --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${NAME}-vpc},{Key=$TAG_KEY,Value=$TAG_VALUE},{Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID}]" \
   --query 'Vpc.VpcId')
 log "VPC: $VPC_ID"
 
@@ -222,7 +228,7 @@ aws ec2 modify-vpc-attribute --region "$REGION" --vpc-id "$VPC_ID" --enable-dns-
 log ""
 log "--- Step 2: Creating Internet Gateway ---"
 IGW_ID=$(aws_cmd ec2 create-internet-gateway \
-  --tag-specifications "ResourceType=internet-gateway,Tags=[{Key=Name,Value=${NAME}-igw},{Key=$TAG_KEY,Value=$TAG_VALUE}]" \
+  --tag-specifications "ResourceType=internet-gateway,Tags=[{Key=Name,Value=${NAME}-igw},{Key=$TAG_KEY,Value=$TAG_VALUE},{Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID}]" \
   --query 'InternetGateway.InternetGatewayId')
 log "IGW: $IGW_ID"
 
@@ -239,7 +245,7 @@ SUBNET_ID=$(aws_cmd ec2 create-subnet \
   --vpc-id "$VPC_ID" \
   --cidr-block "$SUBNET_CIDR" \
   --availability-zone "$AZ" \
-  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${NAME}-subnet},{Key=$TAG_KEY,Value=$TAG_VALUE}]" \
+  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${NAME}-subnet},{Key=$TAG_KEY,Value=$TAG_VALUE},{Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID}]" \
   --query 'Subnet.SubnetId')
 log "Subnet: $SUBNET_ID ($AZ)"
 
@@ -253,7 +259,7 @@ log ""
 log "--- Step 4: Creating Route Table ---"
 RTB_ID=$(aws_cmd ec2 create-route-table \
   --vpc-id "$VPC_ID" \
-  --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=${NAME}-rtb},{Key=$TAG_KEY,Value=$TAG_VALUE}]" \
+  --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=${NAME}-rtb},{Key=$TAG_KEY,Value=$TAG_VALUE},{Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID}]" \
   --query 'RouteTable.RouteTableId')
 log "Route Table: $RTB_ID"
 
@@ -269,7 +275,7 @@ SG_ID=$(aws_cmd ec2 create-security-group \
   --group-name "${NAME}-sg" \
   --description "OpenClaw ${NAME} - outbound only, SSM access" \
   --vpc-id "$VPC_ID" \
-  --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=${NAME}-sg},{Key=$TAG_KEY,Value=$TAG_VALUE}]" \
+  --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=${NAME}-sg},{Key=$TAG_KEY,Value=$TAG_VALUE},{Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID}]" \
   --query 'GroupId')
 log "Security Group: $SG_ID"
 
@@ -294,7 +300,7 @@ TRUST_POLICY='{
 if aws iam create-role --region "$REGION" \
   --role-name "${NAME}-role" \
   --assume-role-policy-document "$TRUST_POLICY" \
-  --tags "Key=$TAG_KEY,Value=$TAG_VALUE" > /dev/null 2>&1; then
+  --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" > /dev/null 2>&1; then
   log "IAM Role: ${NAME}-role (created)"
 else
   log "IAM Role: ${NAME}-role (already exists)"
@@ -637,7 +643,7 @@ INSTANCE_ID=$(aws_cmd ec2 run-instances \
   --security-group-ids "$SG_ID" \
   --iam-instance-profile "Name=${NAME}-instance-profile" \
   --user-data "$USER_DATA_B64" \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME}},{Key=$TAG_KEY,Value=$TAG_VALUE}]" \
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME}},{Key=$TAG_KEY,Value=$TAG_VALUE},{Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID}]" \
   --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
   --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":20,"VolumeType":"gp3","Encrypted":true}}]' \
   --query 'Instances[0].InstanceId')
@@ -732,6 +738,7 @@ cat > "$OUTPUT_PATH" <<OUTEOF
   "name": "$NAME",
   "region": "$REGION",
   "accountId": "$CALLER",
+  "deployId": "$DEPLOY_ID",
   "deployedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "infrastructure": {
     "vpcId": "$VPC_ID",
