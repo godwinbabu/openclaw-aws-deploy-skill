@@ -1,6 +1,14 @@
 ---
 name: openclaw-aws-deploy
-description: Deploy OpenClaw securely on AWS using AWS CLI and infrastructure templates. Use when setting up OpenClaw in AWS with VPC, EC2, SSM-only access, and channel/model bootstrap.
+description: Deploy OpenClaw securely on AWS with a single command. Creates VPC, EC2 (ARM64), Telegram channel, and Gemini Flash model — SSM-only access, no SSH. Use when setting up OpenClaw on AWS, deploying a new agent instance to EC2, or tearing down an existing AWS deployment.
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "☁️",
+        "requires": { "bins": ["aws", "jq", "openssl"] },
+      },
+  }
 ---
 
 # OpenClaw AWS Deploy Skill
@@ -177,5 +185,5 @@ Simplified for reliability — security hardening removed due to namespace issue
 - Never print secrets in logs
 - Never open SSH/inbound ports; use SSM Session Manager only
 - Use least-privilege IAM policies
-- All resources tagged with `Project=<name>` for easier cleanup (deterministic cleanup with unique deploy IDs planned in PR #8)
+- All resources tagged with `Project=<name>` and `DeployId=<unique-id>` for deterministic cleanup
 - Encrypted EBS volumes always

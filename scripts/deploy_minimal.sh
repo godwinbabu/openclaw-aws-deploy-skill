@@ -42,6 +42,8 @@ Options:
   --vpc-cidr <cidr>       VPC CIDR (default: 10.50.0.0/16)
   --subnet-cidr <cidr>    Subnet CIDR (default: 10.50.0.0/24)
   --output <path>         Output JSON file (default: ./deploy-output.json)
+  --personality <name|path>  Agent personality: default, sentinel, researcher,
+                          coder, companion — or path to custom SOUL.md
   --dry-run               Show what would be created without creating
   --cleanup-first         Tear down existing resources with same name first
   -h, --help              Show this help
@@ -58,6 +60,7 @@ SUBNET_CIDR="10.50.0.0/24"
 OUTPUT_PATH="./deploy-output.json"
 DRY_RUN=false
 CLEANUP_FIRST=false
+PERSONALITY="default"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -68,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     --vpc-cidr) VPC_CIDR="${2:-}"; shift 2 ;;
     --subnet-cidr) SUBNET_CIDR="${2:-}"; shift 2 ;;
     --output) OUTPUT_PATH="${2:-}"; shift 2 ;;
+    --personality) PERSONALITY="${2:-}"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --cleanup-first) CLEANUP_FIRST=true; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -119,6 +123,26 @@ for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY TELEGRAM_BOT_TOKEN GEMINI_API
     exit 1
   fi
 done
+
+# Resolve personality file
+PERSONALITIES_DIR="$SKILL_DIR/assets/personalities"
+if [[ -f "$PERSONALITY" ]]; then
+  # Custom path to SOUL.md
+  SOUL_CONTENT=$(cat "$PERSONALITY")
+  log "Personality: custom ($PERSONALITY)"
+elif [[ -f "$PERSONALITIES_DIR/${PERSONALITY}.md" ]]; then
+  # Built-in preset
+  SOUL_CONTENT=$(cat "$PERSONALITIES_DIR/${PERSONALITY}.md")
+  log "Personality: $PERSONALITY (built-in)"
+else
+  echo "ERROR: Unknown personality '$PERSONALITY'" >&2
+  echo "Available: default, sentinel, researcher, coder, companion" >&2
+  echo "Or provide a path to a custom SOUL.md file" >&2
+  exit 1
+fi
+
+# Base64-encode SOUL.md for safe transport in user-data
+SOUL_B64=$(echo "$SOUL_CONTENT" | base64)
 
 # Generate a gateway token
 GATEWAY_TOKEN=$(openssl rand -hex 32)
@@ -569,6 +593,10 @@ SyslogIdentifier=openclaw
 WantedBy=multi-user.target
 SVCEOF
 
+# Write SOUL.md (personality) to workspace
+echo "[$(date)] Writing SOUL.md (personality)..."
+echo "__SOUL_B64__" | base64 -d > /home/openclaw/.openclaw/workspace/SOUL.md
+
 # Fix ownership
 chown -R openclaw:openclaw /home/openclaw/.openclaw
 
@@ -597,6 +625,7 @@ USERDATA
 USER_DATA="${USER_DATA//__NAME__/$NAME}"
 USER_DATA="${USER_DATA//__REGION__/$REGION}"
 USER_DATA="${USER_DATA//__NODE_VERSION__/$NODE_VERSION}"
+USER_DATA="${USER_DATA//__SOUL_B64__/$SOUL_B64}"
 
 # Base64 encode
 USER_DATA_B64=$(echo "$USER_DATA" | base64)
@@ -735,7 +764,8 @@ cat > "$OUTPUT_PATH" <<OUTEOF
     "model": "google/gemini-2.0-flash",
     "channel": "telegram",
     "dmPolicy": "pairing",
-    "gatewayPort": 18789
+    "gatewayPort": 18789,
+    "personality": "$PERSONALITY"
   },
   "access": {
     "ssm": "aws ssm start-session --target $INSTANCE_ID --region $REGION",
