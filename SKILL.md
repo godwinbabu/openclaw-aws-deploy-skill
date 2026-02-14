@@ -24,7 +24,9 @@ Required env files in `--env-dir` (never in git):
 - `.env.aws` — `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`
 - `.env.starfish` — `TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`
 
-Options: `--instance-type` (default: t4g.medium), `--cleanup-first`, `--dry-run`
+Options:
+- `--personality <name|path>` — default, sentinel, researcher, coder, companion, or path to custom SOUL.md
+- `--instance-type` (default: t4g.medium), `--cleanup-first`, `--dry-run`
 
 Output: `deploy-output.json` with all resource IDs and SSM access commands.
 

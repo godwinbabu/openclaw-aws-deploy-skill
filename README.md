@@ -49,7 +49,28 @@ GEMINI_API_KEY=from-aistudio.google.com
 
 ```bash
 ./scripts/deploy_minimal.sh --name my-agent --region us-east-1 \
-  --env-dir /path/to/workspace
+  --env-dir /path/to/workspace --personality sentinel
+```
+
+### Personalities
+
+Choose a built-in personality or bring your own:
+
+| Personality | Description |
+|-------------|-------------|
+| `default` | Helpful, direct, efficient assistant |
+| `sentinel` | Vigilant monitor — alerts, status reports, anomaly detection |
+| `researcher` | Deep-thinking research assistant — sources, analysis, structured findings |
+| `coder` | Pragmatic software engineer — PRs, code review, architecture |
+| `companion` | Warm, empathetic companion — check-ins, accountability, support |
+| *custom path* | Provide path to your own `SOUL.md` file |
+
+```bash
+# Built-in:
+./scripts/deploy_minimal.sh --name watchdog --personality sentinel ...
+
+# Custom:
+./scripts/deploy_minimal.sh --name my-agent --personality ./my-soul.md ...
 ```
 
 ### 3. Pair Telegram
@@ -109,6 +130,13 @@ scripts/
   teardown.sh          ← Clean removal of all resources
   preflight.sh         ← Validate AWS credentials
   smoke_test.sh        ← Post-deploy health check
+
+assets/personalities/  ← Agent personality presets (SOUL.md files)
+  default.md           ← Helpful, direct assistant
+  sentinel.md          ← Vigilant monitor & alerter
+  researcher.md        ← Deep research & analysis
+  coder.md             ← Pragmatic software engineer
+  companion.md         ← Warm, empathetic companion
 
 references/
   TROUBLESHOOTING.md   ← 24 documented issues + solutions
