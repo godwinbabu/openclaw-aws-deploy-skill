@@ -5,7 +5,7 @@ set -euo pipefail
 # deploy_minimal.sh — One-shot minimal OpenClaw deployment to AWS
 #
 # Creates: VPC, subnet, IGW, route table, security group (no inbound),
-#          IAM role (SSM only), SSM parameters, EC2 t4g.small (ARM64)
+#          IAM role (SSM only), SSM parameters, EC2 t4g.medium (ARM64)
 #
 # Prerequisites:
 #   - .env.aws   (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION)
@@ -15,6 +15,18 @@ set -euo pipefail
 # Usage:
 #   ./scripts/deploy_minimal.sh --name starfish --region us-east-1
 #   ./scripts/deploy_minimal.sh --name starfish --region us-east-1 --env-dir /path/to/envs
+#
+# Lessons incorporated (issues #1-24):
+#   - t4g.medium (4GB) required — t4g.small OOMs during npm install + gateway startup
+#   - Node 22+ required — OpenClaw 2026.x needs Node ≥22.12.0
+#   - Official Node tarball — NodeSource setup_22.x unreliable on AL2023 ARM64
+#   - git required — OpenClaw npm install has git-based dependencies
+#   - openclaw@latest — bare "openclaw" may resolve to placeholder package
+#   - gateway run (not start) — start tries systemctl --user which fails
+#   - Simplified systemd — removed ProtectHome/ReadWritePaths that cause issues
+#   - plugins.entries.telegram.enabled: true — must be explicit
+#   - dmPolicy: pairing — not allowlist without users
+#   - auth-profiles.json for Gemini API key
 ###############################################################################
 
 usage() {
@@ -26,7 +38,7 @@ Options:
   --region <region>       AWS region (default: us-east-1)
   --env-dir <path>        Directory containing .env.aws and .env.starfish
                           (default: workspace root)
-  --instance-type <type>  EC2 instance type (default: t4g.small)
+  --instance-type <type>  EC2 instance type (default: t4g.medium)
   --vpc-cidr <cidr>       VPC CIDR (default: 10.50.0.0/16)
   --subnet-cidr <cidr>    Subnet CIDR (default: 10.50.0.0/24)
   --output <path>         Output JSON file (default: ./deploy-output.json)
@@ -36,11 +48,11 @@ Options:
 USAGE
 }
 
-# Defaults
+# Defaults — t4g.medium (4GB) required for OpenClaw 2026.x
 NAME="starfish"
 REGION="us-east-1"
 ENV_DIR=""
-INSTANCE_TYPE="t4g.small"
+INSTANCE_TYPE="t4g.medium"
 VPC_CIDR="10.50.0.0/16"
 SUBNET_CIDR="10.50.0.0/24"
 OUTPUT_PATH="./deploy-output.json"
@@ -135,7 +147,7 @@ if [[ "$CLEANUP_FIRST" == "true" ]]; then
   log ""
   log "--- Step 0: Cleaning up existing $NAME resources ---"
   if [[ -x "$SCRIPT_DIR/teardown.sh" ]]; then
-    "$SCRIPT_DIR/teardown.sh" --name "$NAME" --region "$REGION" --env-dir "$ENV_DIR" || true
+    "$SCRIPT_DIR/teardown.sh" --name "$NAME" --region "$REGION" --env-dir "$ENV_DIR" --yes || true
   else
     log "WARN: teardown.sh not executable, skipping cleanup"
   fi
@@ -212,9 +224,6 @@ SG_ID=$(aws_cmd ec2 create-security-group \
   --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=${NAME}-sg},{Key=$TAG_KEY,Value=$TAG_VALUE}]" \
   --query 'GroupId')
 log "Security Group: $SG_ID"
-
-# Remove default inbound rule (SGs have allow-all outbound by default, no inbound)
-# Default SG already has no inbound rules for a new custom SG
 
 ###############################################################################
 # Step 6: IAM Role (SSM + SSM Parameter Store)
@@ -326,6 +335,9 @@ log "AMI: $AMI_ID"
 log ""
 log "--- Step 9: Generating user-data ---"
 
+# Node version — OpenClaw 2026.x requires ≥22.12.0
+NODE_VERSION="22.14.0"
+
 USER_DATA=$(cat <<'USERDATA'
 #!/bin/bash
 set -euo pipefail
@@ -336,19 +348,28 @@ echo "[$(date)] Starting OpenClaw bootstrap..."
 # Variables (replaced by deploy script)
 AGENT_NAME="__NAME__"
 REGION="__REGION__"
+NODE_VERSION="__NODE_VERSION__"
 
-# Install Node.js 20
-echo "[$(date)] Installing Node.js 20..."
-curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
-dnf install -y nodejs jq
+# Install dependencies (git required for npm, jq for JSON)
+echo "[$(date)] Installing dependencies..."
+dnf install -y git jq tar gzip
 
-# Verify
-node --version
-npm --version
+# Install Node.js from official tarball (NodeSource unreliable on AL2023 ARM64)
+echo "[$(date)] Installing Node.js ${NODE_VERSION}..."
+cd /tmp
+curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.xz" -o node.tar.xz
+tar -xf node.tar.xz -C /usr/local --strip-components=1
+rm node.tar.xz
+hash -r
 
-# Install OpenClaw
+# Verify Node
+echo "[$(date)] Node version: $(node --version)"
+echo "[$(date)] npm version: $(npm --version)"
+
+# Install OpenClaw (must use @latest to avoid placeholder package)
 echo "[$(date)] Installing OpenClaw..."
-npm install -g openclaw
+npm install -g openclaw@latest 2>&1 | tail -20
+echo "[$(date)] OpenClaw path: $(which openclaw)"
 
 # Create openclaw user
 echo "[$(date)] Creating openclaw user..."
@@ -357,8 +378,6 @@ useradd -r -m -s /bin/bash openclaw || true
 # Create directories
 mkdir -p /home/openclaw/.openclaw/agents/main/agent
 mkdir -p /home/openclaw/.openclaw/workspace
-mkdir -p /etc/openclaw
-mkdir -p /tmp/openclaw
 
 # Retrieve secrets from SSM
 echo "[$(date)] Retrieving secrets from SSM..."
@@ -446,24 +465,20 @@ set -e
 
 export HOME="/home/openclaw"
 export PATH="/usr/local/bin:/usr/bin:$PATH"
-export NODE_OPTIONS="--max-old-space-size=512"
+export NODE_OPTIONS="--max-old-space-size=1024"
 export AWS_DEFAULT_REGION="__REGION__"
 export AWS_REGION="__REGION__"
 
-# Kill any stale gateway process
-pkill -f "openclaw-gateway" 2>/dev/null || true
-sleep 2
-
 cd /home/openclaw/.openclaw
 
-# Start gateway in FOREGROUND mode (not 'start' — that tries systemctl --user and fails)
-exec openclaw gateway run --allow-unconfigured
+# Start gateway in FOREGROUND mode
+# CRITICAL: Use 'run' not 'start' — start tries systemctl --user which fails
+exec /usr/local/bin/openclaw gateway run --allow-unconfigured
 STARTEOF
 chmod +x /usr/local/bin/openclaw-startup.sh
-# Replace region placeholder in startup script
 sed -i "s/__REGION__/${REGION}/g" /usr/local/bin/openclaw-startup.sh
 
-# Create systemd service
+# Create systemd service (simplified — security hardening removed due to namespace issues)
 echo "[$(date)] Writing systemd service..."
 cat > /etc/systemd/system/openclaw.service <<'SVCEOF'
 [Unit]
@@ -476,21 +491,10 @@ Wants=network-online.target
 Type=simple
 User=openclaw
 Group=openclaw
-
 WorkingDirectory=/home/openclaw/.openclaw
 ExecStart=/usr/local/bin/openclaw-startup.sh
-
 Restart=on-failure
 RestartSec=10
-
-# Security hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/home/openclaw/.openclaw
-ReadWritePaths=/tmp/openclaw
-PrivateTmp=true
-
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=openclaw
@@ -501,7 +505,6 @@ SVCEOF
 
 # Fix ownership
 chown -R openclaw:openclaw /home/openclaw/.openclaw
-chown -R openclaw:openclaw /tmp/openclaw
 
 # Enable and start
 echo "[$(date)] Starting OpenClaw service..."
@@ -510,9 +513,10 @@ systemctl enable openclaw
 systemctl start openclaw
 
 # Wait and check
-sleep 10
+sleep 15
 if systemctl is-active openclaw; then
   echo "[$(date)] ✅ OpenClaw is running!"
+  journalctl -u openclaw -n 10 --no-pager
 else
   echo "[$(date)] ❌ OpenClaw failed to start"
   journalctl -u openclaw -n 30 --no-pager
@@ -526,6 +530,7 @@ USERDATA
 # Replace placeholders
 USER_DATA="${USER_DATA//__NAME__/$NAME}"
 USER_DATA="${USER_DATA//__REGION__/$REGION}"
+USER_DATA="${USER_DATA//__NODE_VERSION__/$NODE_VERSION}"
 
 # Base64 encode
 USER_DATA_B64=$(echo "$USER_DATA" | base64)
@@ -562,7 +567,7 @@ log "Public IP: $PUBLIC_IP"
 ###############################################################################
 log ""
 log "--- Step 11: Waiting for SSM agent and bootstrap ---"
-log "This takes 3-5 minutes for Node.js + OpenClaw install..."
+log "This takes 4-6 minutes for Node.js + OpenClaw install..."
 
 # Wait for SSM to be available
 for i in $(seq 1 30); do
@@ -580,7 +585,7 @@ done
 
 # Wait for bootstrap to finish (check for the log file marker)
 log "Waiting for bootstrap to complete..."
-for i in $(seq 1 36); do
+for i in $(seq 1 48); do
   RESULT=$(aws ssm send-command --region "$REGION" \
     --instance-ids "$INSTANCE_ID" \
     --document-name "AWS-RunShellScript" \
@@ -598,8 +603,8 @@ for i in $(seq 1 36); do
     fi
   fi
 
-  if [[ $i -eq 36 ]]; then
-    log "WARN: Bootstrap may still be running after 6 min"
+  if [[ $i -eq 48 ]]; then
+    log "WARN: Bootstrap may still be running after 8 min"
     log "Check logs: aws ssm start-session --target $INSTANCE_ID"
   fi
   sleep 10
@@ -611,15 +616,15 @@ done
 log ""
 log "--- Step 12: Smoke Test ---"
 
-SMOKE_CMD='systemctl is-active openclaw && echo "SERVICE_OK" || echo "SERVICE_FAIL"; openclaw status 2>/dev/null || echo "STATUS_CHECK_DONE"'
+SMOKE_CMD='systemctl is-active openclaw && echo "SERVICE_OK"; journalctl -u openclaw -n 5 --no-pager'
 SMOKE_ID=$(aws ssm send-command --region "$REGION" \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
-  --parameters "commands=[\"sudo -u openclaw bash -c 'export HOME=/home/openclaw; $SMOKE_CMD'\"]" \
+  --parameters "commands=[\"$SMOKE_CMD\"]" \
   --query 'Command.CommandId' --output text 2>/dev/null) || true
 
 if [[ -n "$SMOKE_ID" ]]; then
-  sleep 8
+  sleep 10
   SMOKE_OUT=$(aws ssm get-command-invocation --region "$REGION" \
     --command-id "$SMOKE_ID" --instance-id "$INSTANCE_ID" \
     --query 'StandardOutputContent' --output text 2>/dev/null) || true

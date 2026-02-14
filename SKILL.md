@@ -5,7 +5,7 @@ description: Deploy OpenClaw securely on AWS using AWS CLI and infrastructure te
 
 # OpenClaw AWS Deploy Skill
 
-## Quick Start (Minimal Deployment ~$15-20/mo)
+## Quick Start (Minimal Deployment ~$25/mo)
 
 ### Prerequisites
 - `.env.aws` in workspace root:
@@ -19,7 +19,7 @@ description: Deploy OpenClaw securely on AWS using AWS CLI and infrastructure te
   TELEGRAM_BOT_TOKEN=...     # from @BotFather
   GEMINI_API_KEY=...         # from aistudio.google.com (free)
   ```
-- Docker installed (for sandboxed AWS access) OR `aws` CLI on host
+- `aws` CLI installed OR Docker for sandboxed access
 - `jq`, `openssl` available
 
 ### One-Shot Deploy
@@ -39,8 +39,8 @@ This single command:
 2. Creates security group (NO inbound ports — SSM only)
 3. Creates IAM role with minimal permissions (SSM + Parameter Store)
 4. Stores secrets in SSM Parameter Store
-5. Launches t4g.small ARM64 instance with user-data bootstrap
-6. User-data installs Node.js 20 + OpenClaw + configures everything
+5. Launches **t4g.medium** ARM64 instance with user-data bootstrap
+6. User-data installs Node.js 22 + OpenClaw + configures everything
 7. Runs smoke test via SSM
 8. Saves all resource IDs to `deploy-output.json`
 
@@ -60,10 +60,10 @@ This single command:
 
 ```bash
 # Using saved output:
-./scripts/teardown.sh --from-output ./deploy-output.json --env-dir /path/to/workspace
+./scripts/teardown.sh --from-output ./deploy-output.json --env-dir /path/to/workspace --yes
 
 # Or by name (discovers via tags):
-./scripts/teardown.sh --name starfish --region us-east-1 --env-dir /path/to/workspace
+./scripts/teardown.sh --name starfish --region us-east-1 --env-dir /path/to/workspace --yes
 ```
 
 ## Architecture (Minimal)
@@ -74,9 +74,10 @@ This single command:
 │  ┌───────────────────────────────────────────────┐  │
 │  │           Public Subnet (10.50.0.0/24)        │  │
 │  │  ┌─────────────────────────────────────────┐  │  │
-│  │  │      EC2 t4g.small (ARM64, 2GB)         │  │  │
+│  │  │      EC2 t4g.medium (ARM64, 4GB)        │  │  │
 │  │  │  ┌───────────────────────────────────┐  │  │  │
 │  │  │  │       OpenClaw Gateway             │  │  │  │
+│  │  │  │  • Node.js 22.14.0                 │  │  │  │
 │  │  │  │  • Gemini 2.0 Flash (google API)   │  │  │  │
 │  │  │  │  • Telegram channel                │  │  │  │
 │  │  │  │  • Encrypted EBS (gp3, 20GB)       │  │  │  │
@@ -88,20 +89,27 @@ This single command:
     SSM (no SSH/inbound)      Outbound HTTPS only
 ```
 
-## Critical Lessons Learned (18 Issues)
+## Critical Lessons Learned (24 Issues)
 
 These are baked into the deploy script. See `references/TROUBLESHOOTING.md` for full details.
 
-### Instance
-- **t4g.small (2GB) minimum** — t4g.micro (1GB) causes OOM heap allocation failure
+### Instance Sizing
+- **t4g.medium (4GB) required** — t4g.small (2GB) OOMs during npm install + gateway startup
 - **ARM64** — better price/performance than x86
+
+### Node.js
+- **Node 22+ required** — OpenClaw 2026.x requires Node ≥22.12.0
+- **Official tarball install** — NodeSource setup_22.x unreliable on AL2023 ARM64
+- **git required** — OpenClaw npm install has git-based dependencies
+
+### npm
+- **Use `openclaw@latest`** — bare `openclaw` may resolve to placeholder package (0.0.1)
 
 ### Gateway Startup
 - **Use `openclaw gateway run --allow-unconfigured`** — NOT `gateway start` (which tries `systemctl --user` and fails)
 - **Config file must be `openclaw.json`** — not `config.yaml`
 - **`gateway.mode: "local"`** — required or you get "Missing config" error
 - **`gateway.auth.mode: "token"`** — `"none"` is invalid
-- **Kill stale processes** — `pkill -f openclaw-gateway` before restart
 
 ### Telegram
 - **`plugins.entries.telegram.enabled: true`** — must be explicit
@@ -114,12 +122,15 @@ These are baked into the deploy script. See `references/TROUBLESHOOTING.md` for 
 - **Bedrock format** — `amazon-bedrock/MODEL_ID` (not `bedrock/`)
 - **Bedrock models need console enablement** — Anthropic requires use case form
 
+### Systemd Service
+- **Simplified service file** — removed `ProtectHome`, `ReadWritePaths=/tmp/openclaw`, `PrivateTmp` due to namespace issues
+- **Use `NODE_OPTIONS="--max-old-space-size=1024"`** — helps prevent OOM
+
 ### Security
 - **No inbound ports** — SSM Session Manager only
 - **Secrets in SSM Parameter Store** — never in config files or git
 - **Encrypted EBS** — enabled by default in deploy script
 - **IMDSv2 required** — `HttpTokens=required`
-- **Node heap limit** — `NODE_OPTIONS="--max-old-space-size=512"`
 
 ## File Layout
 
@@ -134,7 +145,7 @@ scripts/
   configure_openclaw.sh # SSM-based config push (advanced)
 
 references/
-  TROUBLESHOOTING.md   # All 18 issues + solutions
+  TROUBLESHOOTING.md   # All 24 issues + solutions
   config-templates/    # Ready-to-use config files
     gemini-flash.json  # OpenClaw config for Gemini Flash
     auth-profiles-gemini.json  # Auth profile template
@@ -151,21 +162,20 @@ See `references/config-templates/gemini-flash.json` — includes all required fi
 Create at `~/.openclaw/agents/main/agent/auth-profiles.json`
 
 ### Systemd Service (openclaw.service)
-Includes security hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`
+Simplified for reliability — security hardening removed due to namespace issues.
 
-## Cost Breakdown (~$15-20/mo)
+## Cost Breakdown (~$25/mo)
 | Resource | Cost |
 |----------|------|
-| t4g.small (2GB ARM64) | ~$12.26/mo |
+| t4g.medium (4GB ARM64) | ~$24.53/mo |
 | EBS gp3 20GB | ~$1.60/mo |
 | Public IP | ~$3.65/mo |
 | Gemini Flash | Free tier / ~$0.30/1M tokens |
-| **Total** | **~$17.51/mo** |
+| **Total** | **~$29.78/mo** |
 
 ## Safety Rules
 - Never print secrets in logs
 - Never open SSH/inbound ports; use SSM Session Manager only
 - Use least-privilege IAM policies
 - All resources tagged with `Project=<name>` for easy teardown
-- Kill old gateway process before restart
 - Encrypted EBS volumes always

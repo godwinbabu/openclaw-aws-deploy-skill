@@ -6,7 +6,7 @@ set -e
 
 # Configuration
 export HOME="/home/openclaw"
-OPENCLAW_HOME="/home/openclaw/.openclaw"
+export PATH="/usr/local/bin:/usr/bin:$PATH"
 
 # Logging function
 log() {
@@ -15,13 +15,10 @@ log() {
 
 log "Starting OpenClaw startup sequence..."
 
-# Set PATH
-export PATH="/usr/local/bin:/usr/bin:$PATH"
+# Set Node.js heap limit (1GB is safe for t4g.medium)
+export NODE_OPTIONS="--max-old-space-size=1024"
 
-# Limit Node.js heap (512MB is enough for t4g.small)
-export NODE_OPTIONS="--max-old-space-size=512"
-
-# Verify Node.js
+# Verify Node.js (should be 22+)
 NODE_VERSION=$(node --version)
 log "Node.js version: $NODE_VERSION"
 
@@ -29,14 +26,14 @@ log "Node.js version: $NODE_VERSION"
 OPENCLAW_PATH=$(which openclaw)
 log "OpenClaw path: $OPENCLAW_PATH"
 
-# Set AWS region (for SSM and Bedrock)
-export AWS_DEFAULT_REGION="us-east-1"
-export AWS_REGION="us-east-1"
+# Set AWS region (for SSM)
+export AWS_DEFAULT_REGION="${AWS_REGION:-us-east-1}"
+export AWS_REGION="${AWS_REGION:-us-east-1}"
 
 # Change to OpenClaw directory
-cd "$OPENCLAW_HOME"
+cd /home/openclaw/.openclaw
 
 # Start gateway in FOREGROUND mode
-# Note: We use 'run' not 'start' because 'start' tries systemctl --user
+# CRITICAL: Use 'run' not 'start' — 'start' tries systemctl --user which fails
 log "Starting OpenClaw gateway (foreground)..."
-exec openclaw gateway run --allow-unconfigured
+exec /usr/local/bin/openclaw gateway run --allow-unconfigured

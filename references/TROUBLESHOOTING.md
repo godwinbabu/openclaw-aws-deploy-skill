@@ -306,3 +306,83 @@ aws bedrock list-foundation-models --region us-east-1
 # Test Gemini API key
 curl "https://generativelanguage.googleapis.com/v1/models?key=YOUR_KEY"
 ```
+
+## Issues Added 2026-02-15
+
+### #19: ReadWritePaths=/tmp/openclaw + PrivateTmp Conflict
+**Symptom:**
+```
+openclaw.service: Failed to set up mount namespacing: /run/systemd/unit-root/tmp/openclaw: No such file or directory
+```
+
+**Cause:** `ReadWritePaths=/tmp/openclaw` + `PrivateTmp=true` creates a namespace conflict when the directory doesn't exist.
+
+**Solution:** Remove `ReadWritePaths=/tmp/openclaw` from systemd service. `PrivateTmp=true` handles temp isolation.
+
+Better yet, use a simplified systemd service without `ProtectHome`, `ProtectSystem=strict`, or `ReadWritePaths` — these cause more issues than they solve in this context.
+
+### #20: npm install openclaw Gets Placeholder Package
+**Symptom:**
+```
+openclaw@0.0.1 installed
+```
+
+**Cause:** There's a placeholder package `openclaw@0.0.1` on npm. Bare `npm install -g openclaw` may resolve to it.
+
+**Solution:** Always use version specifier:
+```bash
+npm install -g openclaw@latest
+```
+
+### #21: npm install Fails — git Not Found
+**Symptom:**
+```
+npm error code ENOENT
+npm error syscall spawn git
+npm error path git
+npm error An unknown git error occurred
+```
+
+**Cause:** OpenClaw has git-based dependencies. AL2023 minimal doesn't include git.
+
+**Solution:** Install git before npm:
+```bash
+dnf install -y git
+npm install -g openclaw@latest
+```
+
+### #22: Node 20 Not Supported
+**Symptom:**
+```
+openclaw requires Node >=22.12.0.
+Detected: node 20.20.0
+```
+
+**Cause:** OpenClaw 2026.x requires Node.js 22+.
+
+**Solution:** Install Node 22.14.0 or later.
+
+### #23: NodeSource setup_22.x Doesn't Work on AL2023 ARM64
+**Symptom:** After running `curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -`, `dnf install nodejs` still installs Node 20.
+
+**Cause:** NodeSource repository may not have Node 22 packages for AL2023 ARM64, or the repo configuration doesn't override existing packages.
+
+**Solution:** Install Node.js from official tarball:
+```bash
+curl -fsSL "https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-arm64.tar.xz" -o node.tar.xz
+tar -xf node.tar.xz -C /usr/local --strip-components=1
+rm node.tar.xz
+```
+
+### #24: t4g.small (2GB) Still OOMs During OpenClaw Startup
+**Symptom:**
+```
+FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory
+v8::internal::Heap::CollectGarbage...
+```
+
+**Cause:** OpenClaw 2026.x + npm install + gateway startup exceeds 2GB RAM on t4g.small.
+
+**Solution:** Use t4g.medium (4GB RAM). Cost increase ~$12/mo but necessary for reliability.
+
+Alternative (not recommended): Add swap space, but this slows everything down on EBS.
