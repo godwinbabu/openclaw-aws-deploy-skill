@@ -8,13 +8,13 @@ description: Deploy OpenClaw securely on AWS using AWS CLI and infrastructure te
 ## Quick Start (Minimal Deployment ~$25/mo)
 
 ### Prerequisites
-- `.env.aws` in workspace root:
+- `.env.aws` in workspace root (recommended) or skill directory:
   ```
   AWS_ACCESS_KEY_ID=...
   AWS_SECRET_ACCESS_KEY=...
   AWS_DEFAULT_REGION=us-east-1
   ```
-- `.env.starfish` in workspace root:
+- `.env.starfish` in workspace root (recommended) or skill directory:
   ```
   TELEGRAM_BOT_TOKEN=...     # from @BotFather
   GEMINI_API_KEY=...         # from aistudio.google.com (free)
@@ -38,7 +38,7 @@ This single command:
 1. Creates VPC + subnet + IGW + route table
 2. Creates security group (NO inbound ports — SSM only)
 3. Creates IAM role with minimal permissions (SSM + Parameter Store)
-4. Stores secrets in SSM Parameter Store
+4. Stores secrets in SSM Parameter Store (sourced at bootstrap, persisted on-instance in OpenClaw config files)
 5. Launches **t4g.medium** ARM64 instance with user-data bootstrap
 6. User-data installs Node.js 22 + OpenClaw + configures everything
 7. Runs smoke test via SSM
@@ -128,7 +128,7 @@ These are baked into the deploy script. See `references/TROUBLESHOOTING.md` for 
 
 ### Security
 - **No inbound ports** — SSM Session Manager only
-- **Secrets in SSM Parameter Store** — never in config files or git
+- **Secrets sourced from SSM Parameter Store** — sourced at bootstrap, then persisted on-instance in OpenClaw config files (never in git)
 - **Encrypted EBS** — enabled by default in deploy script
 - **IMDSv2 required** — `HttpTokens=required`
 
@@ -177,5 +177,5 @@ Simplified for reliability — security hardening removed due to namespace issue
 - Never print secrets in logs
 - Never open SSH/inbound ports; use SSM Session Manager only
 - Use least-privilege IAM policies
-- All resources tagged with `Project=<name>` for easy teardown
+- All resources tagged with `Project=<name>` for easier cleanup (deterministic cleanup with unique deploy IDs planned in PR #8)
 - Encrypted EBS volumes always
