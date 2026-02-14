@@ -24,8 +24,8 @@ metadata:
   ```
 - `.env.starfish` in workspace root (recommended) or skill directory:
   ```
-  TELEGRAM_BOT_TOKEN=...     # from @BotFather
-  GEMINI_API_KEY=...         # from aistudio.google.com (free)
+  TELEGRAM_BOT_TOKEN=...     # from @BotFather (required)
+  GEMINI_API_KEY=...         # from aistudio.google.com (optional, for Gemini models)
   ```
 - `aws` CLI installed OR Docker for sandboxed access
 - `jq`, `openssl` available
@@ -74,22 +74,26 @@ This single command:
 ./scripts/teardown.sh --name starfish --region us-east-1 --env-dir /path/to/workspace --yes
 ```
 
-## AWS Bedrock Model Support
+## Model Support
 
-Instead of Gemini, you can deploy with AWS Bedrock models using the `--model` flag:
+### `--model` flag
+
+Pass any model string — it goes directly into `openclaw.json` as `model.primary`:
 
 ```bash
+# Default (Gemini Flash — needs GEMINI_API_KEY in .env.starfish)
+./scripts/deploy_minimal.sh --name starfish --region us-east-1
+
+# Bedrock model (no API key needed — uses IAM role)
 ./scripts/deploy_minimal.sh --name starfish --region us-east-1 \
   --model amazon-bedrock/minimax.minimax-m2.1
 ```
 
-### How it works
-- Bedrock models use the EC2 instance's **IAM role** for authentication — no API key needed
-- The deploy script automatically adds `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` permissions to the instance role
-- `GEMINI_API_KEY` is **not required** in `.env.starfish` when using Bedrock
-- `auth-profiles.json` is created with empty profiles (IAM credentials are used automatically)
+### AWS Bedrock
 
-### Available Bedrock models
+Bedrock IAM permissions (`bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream`) are **always added** to the instance role — regardless of which model you choose. This means any deployed instance can use Bedrock models out of the box via IAM role credentials (no API key needed).
+
+Known Bedrock model IDs:
 | Model flag | Description |
 |------------|-------------|
 | `amazon-bedrock/minimax.minimax-m2.1` | MiniMax M2.1 |
@@ -97,13 +101,17 @@ Instead of Gemini, you can deploy with AWS Bedrock models using the `--model` fl
 | `amazon-bedrock/deepseek.deepseek-r1` | DeepSeek R1 |
 | `amazon-bedrock/moonshotai.kimi-k2.5` | Kimi K2.5 |
 
-### `.env.starfish` for Bedrock
-When using Bedrock, your `.env.starfish` only needs:
-```
-TELEGRAM_BOT_TOKEN=...     # from @BotFather
-```
-
 > **Note:** Bedrock models must be enabled in your AWS account via the Bedrock console before use.
+
+### Gemini
+
+If `GEMINI_API_KEY` is present in `.env.starfish`, it's stored in SSM and written to `auth-profiles.json`. If absent, it's simply skipped — no error.
+
+### `.env.starfish`
+```
+TELEGRAM_BOT_TOKEN=...     # Required — from @BotFather
+GEMINI_API_KEY=...         # Optional — from aistudio.google.com (needed for Gemini models)
+```
 
 ## Architecture (Minimal)
 
