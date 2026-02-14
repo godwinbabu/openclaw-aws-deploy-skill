@@ -15,6 +15,7 @@ set -euo pipefail
 # Usage:
 #   ./scripts/deploy_minimal.sh --name starfish --region us-east-1
 #   ./scripts/deploy_minimal.sh --name starfish --region us-east-1 --env-dir /path/to/envs
+#   ./scripts/deploy_minimal.sh --name starfish --region us-east-1 --model amazon-bedrock/minimax.minimax-m2.1
 #
 # Lessons incorporated (issues #1-24):
 #   - t4g.medium (4GB) required — t4g.small OOMs during npm install + gateway startup
@@ -42,6 +43,14 @@ Options:
   --vpc-cidr <cidr>       VPC CIDR (default: 10.50.0.0/16)
   --subnet-cidr <cidr>    Subnet CIDR (default: 10.50.0.0/24)
   --output <path>         Output JSON file (default: ./deploy-output.json)
+  --model <model>         AI model (default: google/gemini-2.0-flash)
+                          Gemini: google/gemini-2.0-flash (requires GEMINI_API_KEY)
+                          Bedrock: amazon-bedrock/<model-id> (uses IAM role, no API key)
+                            Known Bedrock models:
+                              amazon-bedrock/minimax.minimax-m2.1  (MiniMax M2.1)
+                              amazon-bedrock/minimax.minimax-m2    (MiniMax M2)
+                              amazon-bedrock/deepseek.deepseek-r1  (DeepSeek R1)
+                              amazon-bedrock/moonshotai.kimi-k2.5  (Kimi K2.5)
   --personality <name|path>  Agent personality: default, sentinel, researcher,
                           coder, companion — or path to custom SOUL.md
   --dry-run               Show what would be created without creating
@@ -58,6 +67,7 @@ INSTANCE_TYPE="t4g.medium"
 VPC_CIDR="10.50.0.0/16"
 SUBNET_CIDR="10.50.0.0/24"
 OUTPUT_PATH="./deploy-output.json"
+MODEL="google/gemini-2.0-flash"
 DRY_RUN=false
 CLEANUP_FIRST=false
 PERSONALITY="default"
@@ -71,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --vpc-cidr) VPC_CIDR="${2:-}"; shift 2 ;;
     --subnet-cidr) SUBNET_CIDR="${2:-}"; shift 2 ;;
     --output) OUTPUT_PATH="${2:-}"; shift 2 ;;
+    --model) MODEL="${2:-}"; shift 2 ;;
     --personality) PERSONALITY="${2:-}"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --cleanup-first) CLEANUP_FIRST=true; shift ;;
@@ -97,6 +108,13 @@ fi
 
 ENV_DIR="$(cd "$ENV_DIR" && pwd)"
 
+# Determine model provider
+if [[ "$MODEL" == amazon-bedrock/* ]]; then
+  MODEL_PROVIDER="bedrock"
+else
+  MODEL_PROVIDER="gemini"
+fi
+
 # Load credentials
 if [[ ! -f "$ENV_DIR/.env.aws" ]]; then
   echo "ERROR: $ENV_DIR/.env.aws not found" >&2
@@ -117,7 +135,11 @@ done < <(grep -E '^[A-Z0-9_]+=' "$ENV_DIR/.env.starfish")
 export AWS_DEFAULT_REGION="$REGION"
 
 # Validate required vars
-for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY TELEGRAM_BOT_TOKEN GEMINI_API_KEY; do
+REQUIRED_VARS=(AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY TELEGRAM_BOT_TOKEN)
+if [[ "$MODEL_PROVIDER" == "gemini" ]]; then
+  REQUIRED_VARS+=(GEMINI_API_KEY)
+fi
+for var in "${REQUIRED_VARS[@]}"; do
   if [[ -z "${!var:-}" ]]; then
     echo "ERROR: $var is not set" >&2
     exit 1
@@ -182,6 +204,7 @@ trap cleanup_on_failure EXIT
 log "=========================================="
 log "  OpenClaw Minimal Deploy: $NAME"
 log "  Region: $REGION | Instance: $INSTANCE_TYPE"
+log "  Model:  $MODEL ($MODEL_PROVIDER)"
 log "=========================================="
 
 # Verify AWS identity
@@ -333,6 +356,30 @@ aws iam put-role-policy --role-name "${NAME}-role" \
   --policy-name SSMParameterAccess \
   --policy-document "$SSM_PARAM_POLICY"
 
+# Add Bedrock permissions if needed
+if [[ "$MODEL_PROVIDER" == "bedrock" ]]; then
+  BEDROCK_POLICY=$(cat <<BPOLICY
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": "arn:aws:bedrock:${REGION}::foundation-model/*"
+    }
+  ]
+}
+BPOLICY
+)
+  aws iam put-role-policy --role-name "${NAME}-role" \
+    --policy-name BedrockAccess \
+    --policy-document "$BEDROCK_POLICY"
+  log "Added BedrockAccess inline policy"
+fi
+
 # Create instance profile
 if aws iam create-instance-profile --instance-profile-name "${NAME}-instance-profile" > /dev/null 2>&1; then
   log "Instance Profile: ${NAME}-instance-profile (created)"
@@ -362,12 +409,14 @@ aws ssm put-parameter --region "$REGION" \
   --overwrite > /dev/null
 log "Stored: /${NAME}/telegram/bot_token"
 
-aws ssm put-parameter --region "$REGION" \
-  --name "/${NAME}/gemini/api_key" \
-  --value "$GEMINI_API_KEY" \
-  --type SecureString \
-  --overwrite > /dev/null
-log "Stored: /${NAME}/gemini/api_key"
+if [[ "$MODEL_PROVIDER" == "gemini" ]]; then
+  aws ssm put-parameter --region "$REGION" \
+    --name "/${NAME}/gemini/api_key" \
+    --value "$GEMINI_API_KEY" \
+    --type SecureString \
+    --overwrite > /dev/null
+  log "Stored: /${NAME}/gemini/api_key"
+fi
 
 aws ssm put-parameter --region "$REGION" \
   --name "/${NAME}/gateway/token" \
@@ -406,6 +455,8 @@ echo "[$(date)] Starting OpenClaw bootstrap..."
 AGENT_NAME="__NAME__"
 REGION="__REGION__"
 NODE_VERSION="__NODE_VERSION__"
+MODEL="__MODEL__"
+MODEL_PROVIDER="__MODEL_PROVIDER__"
 
 # Retry helper — 3 retries with exponential backoff
 retry_cmd() {
@@ -472,7 +523,9 @@ mkdir -p /home/openclaw/.openclaw/workspace
 # Retrieve secrets from SSM
 echo "[$(date)] Retrieving secrets from SSM..."
 TELEGRAM_TOKEN=$(aws ssm get-parameter --region "$REGION" --name "/${AGENT_NAME}/telegram/bot_token" --with-decryption --query 'Parameter.Value' --output text)
-GEMINI_KEY=$(aws ssm get-parameter --region "$REGION" --name "/${AGENT_NAME}/gemini/api_key" --with-decryption --query 'Parameter.Value' --output text)
+if [[ "$MODEL_PROVIDER" == "gemini" ]]; then
+  GEMINI_KEY=$(aws ssm get-parameter --region "$REGION" --name "/${AGENT_NAME}/gemini/api_key" --with-decryption --query 'Parameter.Value' --output text)
+fi
 GW_TOKEN=$(aws ssm get-parameter --region "$REGION" --name "/${AGENT_NAME}/gateway/token" --with-decryption --query 'Parameter.Value' --output text)
 
 # Create OpenClaw config
@@ -491,7 +544,7 @@ cat > /home/openclaw/.openclaw/openclaw.json <<OCEOF
   "agents": {
     "defaults": {
       "model": {
-        "primary": "google/gemini-2.0-flash"
+        "primary": "${MODEL}"
       },
       "workspace": "/home/openclaw/.openclaw/workspace",
       "heartbeat": {
@@ -532,9 +585,10 @@ cat > /home/openclaw/.openclaw/openclaw.json <<OCEOF
 }
 OCEOF
 
-# Create auth profiles for Gemini
+# Create auth profiles
 echo "[$(date)] Writing auth-profiles.json..."
-cat > /home/openclaw/.openclaw/agents/main/agent/auth-profiles.json <<APEOF
+if [[ "$MODEL_PROVIDER" == "gemini" ]]; then
+  cat > /home/openclaw/.openclaw/agents/main/agent/auth-profiles.json <<APEOF
 {
   "version": 1,
   "profiles": {
@@ -546,6 +600,15 @@ cat > /home/openclaw/.openclaw/agents/main/agent/auth-profiles.json <<APEOF
   }
 }
 APEOF
+else
+  # Bedrock uses IAM role credentials automatically — no API key needed
+  cat > /home/openclaw/.openclaw/agents/main/agent/auth-profiles.json <<APEOF
+{
+  "version": 1,
+  "profiles": {}
+}
+APEOF
+fi
 
 # Create startup script
 echo "[$(date)] Writing startup script..."
@@ -625,6 +688,8 @@ USERDATA
 USER_DATA="${USER_DATA//__NAME__/$NAME}"
 USER_DATA="${USER_DATA//__REGION__/$REGION}"
 USER_DATA="${USER_DATA//__NODE_VERSION__/$NODE_VERSION}"
+USER_DATA="${USER_DATA//__MODEL__/$MODEL}"
+USER_DATA="${USER_DATA//__MODEL_PROVIDER__/$MODEL_PROVIDER}"
 USER_DATA="${USER_DATA//__SOUL_B64__/$SOUL_B64}"
 
 # Base64 encode
@@ -761,7 +826,8 @@ cat > "$OUTPUT_PATH" <<OUTEOF
     "/${NAME}/gateway/token"
   ],
   "config": {
-    "model": "google/gemini-2.0-flash",
+    "model": "$MODEL",
+    "modelProvider": "$MODEL_PROVIDER",
     "channel": "telegram",
     "dmPolicy": "pairing",
     "gatewayPort": 18789,
@@ -781,7 +847,7 @@ log "=========================================="
 log ""
 log "  Instance:  $INSTANCE_ID"
 log "  Public IP: $PUBLIC_IP"
-log "  Model:     google/gemini-2.0-flash"
+log "  Model:     $MODEL ($MODEL_PROVIDER)"
 log "  Channel:   Telegram (@${NAME} bot)"
 log ""
 log "  SSM Access:"
