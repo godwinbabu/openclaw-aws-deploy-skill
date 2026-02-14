@@ -1,1 +1,14 @@
+# Credentials (NEVER commit)
+.env.*
+*.env
+
+# Deploy outputs (contain resource IDs)
 deploy-output.json
+*-output.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
