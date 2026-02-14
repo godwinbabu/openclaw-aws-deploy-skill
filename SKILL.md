@@ -1,6 +1,6 @@
 ---
 name: openclaw-aws-deploy
-description: Deploy OpenClaw securely on AWS with a single command. Creates VPC, EC2 (ARM64), Telegram channel, and Gemini Flash model — SSM-only access, no SSH. Use when setting up OpenClaw on AWS, deploying a new agent instance to EC2, or tearing down an existing AWS deployment.
+description: Deploy OpenClaw securely on AWS with a single command. Creates VPC, EC2 (ARM64), Telegram channel, and configurable AI model (Bedrock, Gemini, or any provider) — SSM-only access, no SSH. Use when setting up OpenClaw on AWS, deploying a new agent instance to EC2, or tearing down an existing AWS deployment.
 metadata:
   {
     "openclaw":
@@ -24,8 +24,8 @@ metadata:
   ```
 - `.env.starfish` in workspace root (recommended) or skill directory:
   ```
-  TELEGRAM_BOT_TOKEN=...     # from @BotFather
-  GEMINI_API_KEY=...         # from aistudio.google.com (free)
+  TELEGRAM_BOT_TOKEN=...     # from @BotFather (required)
+  GEMINI_API_KEY=...         # from aistudio.google.com (optional, for Gemini models)
   ```
 - `aws` CLI installed OR Docker for sandboxed access
 - `jq`, `openssl` available
@@ -45,7 +45,7 @@ metadata:
 This single command:
 1. Creates VPC + subnet + IGW + route table
 2. Creates security group (NO inbound ports — SSM only)
-3. Creates IAM role with minimal permissions (SSM + Parameter Store)
+3. Creates IAM role with minimal permissions (SSM + Parameter Store + Bedrock)
 4. Stores secrets in SSM Parameter Store (sourced at bootstrap, persisted on-instance in OpenClaw config files)
 5. Launches **t4g.medium** ARM64 instance with user-data bootstrap
 6. User-data installs Node.js 22 + OpenClaw + configures everything
@@ -74,6 +74,45 @@ This single command:
 ./scripts/teardown.sh --name starfish --region us-east-1 --env-dir /path/to/workspace --yes
 ```
 
+## Model Support
+
+### `--model` flag
+
+Pass any model string — it goes directly into `openclaw.json` as `model.primary`:
+
+```bash
+# Default (Gemini Flash — needs GEMINI_API_KEY in .env.starfish)
+./scripts/deploy_minimal.sh --name starfish --region us-east-1
+
+# Bedrock model (no API key needed — uses IAM role)
+./scripts/deploy_minimal.sh --name starfish --region us-east-1 \
+  --model amazon-bedrock/minimax.minimax-m2.1
+```
+
+### AWS Bedrock
+
+Bedrock IAM permissions (`bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream`) are **always added** to the instance role — regardless of which model you choose. This means any deployed instance can use Bedrock models out of the box via IAM role credentials (no API key needed).
+
+Known Bedrock model IDs:
+| Model flag | Description |
+|------------|-------------|
+| `amazon-bedrock/minimax.minimax-m2.1` | MiniMax M2.1 |
+| `amazon-bedrock/minimax.minimax-m2` | MiniMax M2 |
+| `amazon-bedrock/deepseek.deepseek-r1` | DeepSeek R1 |
+| `amazon-bedrock/moonshotai.kimi-k2.5` | Kimi K2.5 |
+
+> **Note:** Bedrock models must be enabled in your AWS account via the Bedrock console before use.
+
+### Gemini
+
+If `GEMINI_API_KEY` is present in `.env.starfish`, it's stored in SSM and written to `auth-profiles.json`. If absent, it's simply skipped — no error.
+
+### `.env.starfish`
+```
+TELEGRAM_BOT_TOKEN=...     # Required — from @BotFather
+GEMINI_API_KEY=...         # Optional — from aistudio.google.com (needed for Gemini models)
+```
+
 ## Architecture (Minimal)
 
 ```
@@ -86,7 +125,7 @@ This single command:
 │  │  │  ┌───────────────────────────────────┐  │  │  │
 │  │  │  │       OpenClaw Gateway             │  │  │  │
 │  │  │  │  • Node.js 22.14.0                 │  │  │  │
-│  │  │  │  • Gemini 2.0 Flash (google API)   │  │  │  │
+│  │  │  │  • Any model (Bedrock/Gemini/etc)   │  │  │  │
 │  │  │  │  • Telegram channel                │  │  │  │
 │  │  │  │  • Encrypted EBS (gp3, 20GB)       │  │  │  │
 │  │  │  └───────────────────────────────────┘  │  │  │
