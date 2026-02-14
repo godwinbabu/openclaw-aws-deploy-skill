@@ -103,9 +103,14 @@ if [[ ! -f "$ENV_DIR/.env.starfish" ]]; then
   exit 1
 fi
 
-source "$ENV_DIR/.env.aws"
-source "$ENV_DIR/.env.starfish"
-export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION="$REGION"
+# Secure env parsing — only export strict KEY=VALUE lines (no arbitrary code execution)
+while IFS='=' read -r key value; do
+  export "$key=$value"
+done < <(grep -E '^[A-Z0-9_]+=' "$ENV_DIR/.env.aws")
+while IFS='=' read -r key value; do
+  export "$key=$value"
+done < <(grep -E '^[A-Z0-9_]+=' "$ENV_DIR/.env.starfish")
+export AWS_DEFAULT_REGION="$REGION"
 
 # Validate required vars
 for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY TELEGRAM_BOT_TOKEN GEMINI_API_KEY; do
@@ -124,6 +129,25 @@ aws_json() { aws --region "$REGION" --output json "$@"; }
 
 TAG_KEY="Project"
 TAG_VALUE="$NAME"
+
+# Trap: print cleanup instructions on failure
+cleanup_on_failure() {
+  local exit_code=$?
+  if [[ $exit_code -ne 0 ]]; then
+    echo "" >&2
+    echo "=========================================" >&2
+    echo "  ❌ Deploy failed (exit code $exit_code)" >&2
+    echo "  Resources may have been partially created." >&2
+    echo "" >&2
+    echo "  To clean up, run:" >&2
+    echo "    $SCRIPT_DIR/teardown.sh --name $NAME --region $REGION --env-dir $ENV_DIR --yes" >&2
+    echo "" >&2
+    echo "  Or if deploy-output.json was written:" >&2
+    echo "    $SCRIPT_DIR/teardown.sh --from-output $OUTPUT_PATH --env-dir $ENV_DIR --yes" >&2
+    echo "=========================================" >&2
+  fi
+}
+trap cleanup_on_failure EXIT
 
 log "=========================================="
 log "  OpenClaw Minimal Deploy: $NAME"
@@ -282,15 +306,18 @@ aws iam put-role-policy --role-name "${NAME}-role" \
 # Create instance profile
 if aws iam create-instance-profile --instance-profile-name "${NAME}-instance-profile" > /dev/null 2>&1; then
   log "Instance Profile: ${NAME}-instance-profile (created)"
-  aws iam add-role-to-instance-profile \
-    --instance-profile-name "${NAME}-instance-profile" \
-    --role-name "${NAME}-role" 2>/dev/null || true
-  # Wait for profile to propagate
-  log "Waiting 10s for IAM propagation..."
-  sleep 10
 else
   log "Instance Profile: ${NAME}-instance-profile (already exists)"
 fi
+
+# Ensure role is attached (idempotent — ignore EntityAlreadyExists)
+aws iam add-role-to-instance-profile \
+  --instance-profile-name "${NAME}-instance-profile" \
+  --role-name "${NAME}-role" 2>/dev/null || true
+
+# Wait for profile to propagate
+log "Waiting 10s for IAM propagation..."
+sleep 10
 
 ###############################################################################
 # Step 7: Store secrets in SSM Parameter Store
@@ -350,16 +377,49 @@ AGENT_NAME="__NAME__"
 REGION="__REGION__"
 NODE_VERSION="__NODE_VERSION__"
 
+# Retry helper — 3 retries with exponential backoff
+retry_cmd() {
+  local max_retries=3
+  local delay=5
+  local attempt=1
+  while true; do
+    if "$@"; then
+      return 0
+    fi
+    if [[ $attempt -ge $max_retries ]]; then
+      echo "[$(date)] FATAL: Command failed after $max_retries attempts: $*" >&2
+      return 1
+    fi
+    echo "[$(date)] Attempt $attempt failed, retrying in ${delay}s..."
+    sleep $delay
+    delay=$((delay * 2))
+    attempt=$((attempt + 1))
+  done
+}
+
 # Install dependencies (git required for npm, jq for JSON)
 echo "[$(date)] Installing dependencies..."
-dnf install -y git jq tar gzip
+retry_cmd dnf install -y git jq tar gzip
 
 # Install Node.js from official tarball (NodeSource unreliable on AL2023 ARM64)
 echo "[$(date)] Installing Node.js ${NODE_VERSION}..."
 cd /tmp
-curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.xz" -o node.tar.xz
+NODE_TARBALL="node-v${NODE_VERSION}-linux-arm64.tar.xz"
+retry_cmd curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/${NODE_TARBALL}" -o node.tar.xz
+retry_cmd curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" -o SHASUMS256.txt
+
+# Verify tarball integrity
+echo "[$(date)] Verifying Node.js tarball SHA256..."
+EXPECTED_SHA=$(grep "${NODE_TARBALL}" SHASUMS256.txt | awk '{print $1}')
+ACTUAL_SHA=$(sha256sum node.tar.xz | awk '{print $1}')
+if [[ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]]; then
+  echo "[$(date)] FATAL: SHA256 mismatch! Expected=$EXPECTED_SHA Actual=$ACTUAL_SHA" >&2
+  exit 1
+fi
+echo "[$(date)] SHA256 verified OK"
+
 tar -xf node.tar.xz -C /usr/local --strip-components=1
-rm node.tar.xz
+rm -f node.tar.xz SHASUMS256.txt
 hash -r
 
 # Verify Node
@@ -368,7 +428,7 @@ echo "[$(date)] npm version: $(npm --version)"
 
 # Install OpenClaw (must use @latest to avoid placeholder package)
 echo "[$(date)] Installing OpenClaw..."
-npm install -g openclaw@latest 2>&1 | tail -20
+retry_cmd npm install -g openclaw@latest 2>&1 | tail -20
 echo "[$(date)] OpenClaw path: $(which openclaw)"
 
 # Create openclaw user

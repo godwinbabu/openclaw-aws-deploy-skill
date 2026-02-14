@@ -42,6 +42,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Check jq dependency when --from-output is used
+if [[ -n "$FROM_OUTPUT" ]] && ! command -v jq &>/dev/null; then
+  echo "ERROR: jq is required when using --from-output. Install with: brew install jq (macOS) or dnf install jq (AL2023)" >&2
+  exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -55,8 +61,12 @@ if [[ -z "$ENV_DIR" ]]; then
   fi
 fi
 
-source "$(cd "$ENV_DIR" && pwd)/.env.aws"
-export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION="$REGION"
+# Secure env parsing — only export strict KEY=VALUE lines (no arbitrary code execution)
+ENV_DIR="$(cd "$ENV_DIR" && pwd)"
+while IFS='=' read -r key value; do
+  export "$key=$value"
+done < <(grep -E '^[A-Z0-9_]+=' "$ENV_DIR/.env.aws")
+export AWS_DEFAULT_REGION="$REGION"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 aws_cmd() { aws --region "$REGION" --output text "$@" 2>/dev/null || echo ""; }
