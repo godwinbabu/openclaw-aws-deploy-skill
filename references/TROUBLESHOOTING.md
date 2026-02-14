@@ -386,3 +386,25 @@ v8::internal::Heap::CollectGarbage...
 **Solution:** Use t4g.medium (4GB RAM). Cost increase ~$12/mo but necessary for reliability.
 
 Alternative (not recommended): Add swap space, but this slows everything down on EBS.
+
+### #25: "No API key found for amazon-bedrock" on EC2 Instance
+**Symptom:** OpenClaw fails with `No API key found for amazon-bedrock` even though IAM role has Bedrock permissions.
+
+**Cause:** OpenClaw's credential detection checks environment variables, not EC2 instance metadata (IMDS). Without `AWS_PROFILE` set, it doesn't know AWS credentials are available.
+
+**Solution:** Add `export AWS_PROFILE=default` to the startup script. This signals to the AWS SDK that credentials are available via the default credential chain (which includes instance roles).
+
+```bash
+# In /usr/local/bin/openclaw-startup.sh:
+export AWS_PROFILE=default
+export AWS_REGION=us-east-1
+```
+
+Also ensure the IAM policy includes `bedrock:ListFoundationModels` for automatic model discovery.
+
+### #26: log() Function Called Before Definition in deploy_minimal.sh
+**Symptom:** `log: Unknown subcommand` error on macOS during deploy — personality resolution calls `log` before the function is defined.
+
+**Cause:** Personality resolution code (lines ~150) calls `log()` but the function wasn't defined until line ~170.
+
+**Solution:** Move `log()`, `aws_cmd()`, `aws_json()` definitions before first use (before personality resolution).
