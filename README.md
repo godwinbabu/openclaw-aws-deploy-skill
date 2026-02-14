@@ -2,7 +2,7 @@
 
 **One-shot OpenClaw deployment to AWS** — VPC, EC2, Telegram, Gemini Flash, all in one command.
 
-[![ClawHub](https://img.shields.io/badge/ClawHub-openclaw--aws--deploy-blue)](https://clawhub.ai)
+[![ClawHub](https://img.shields.io/badge/ClawHub-openclaw--aws--deploy-blue)](https://clawhub.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## What It Does
@@ -95,19 +95,19 @@ sudo -u openclaw bash -c "export HOME=/home/openclaw; openclaw pairing approve t
 | Feature | Detail |
 |---------|--------|
 | **No SSH** | SSM Session Manager only — zero inbound ports |
-| **No secrets in code** | All credentials in SSM Parameter Store (encrypted) |
+| **Secrets from SSM** | Credentials sourced from SSM at bootstrap, persisted on-instance in OpenClaw config files |
 | **Encrypted storage** | EBS volumes use AES-256 encryption |
 | **IMDSv2 enforced** | Instance metadata requires session tokens |
 | **Minimal IAM** | Only SSM + Parameter Store read access |
 | **Secure env parsing** | Credential files parsed as key=value, not `source`d |
-| **Tagged resources** | All resources tagged for deterministic cleanup |
+| **Tagged resources** | All resources tagged by project name for easier cleanup (deterministic cleanup via unique deploy IDs planned in PR #8) |
 | **Node integrity** | SHA256 verification on Node.js tarball |
 | **Retry with backoff** | Network operations retry on transient failures |
-| **Failure cleanup** | Mid-deploy failures print deterministic teardown commands |
+| **Failure cleanup** | Mid-deploy failures print teardown commands |
 
 ### Credential files
 
-`.env.aws` and `.env.starfish` must live **outside** the skill directory and are `.gitignore`d. They are parsed as strict `KEY=VALUE` — no shell execution.
+`.env.aws` and `.env.starfish` are recommended to live **outside** the skill directory (the script also checks the skill dir as a fallback). Both are `.gitignore`d. They are parsed as strict `KEY=VALUE` — no shell execution.
 
 ## What Gets Created
 

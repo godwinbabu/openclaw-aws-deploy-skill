@@ -55,7 +55,7 @@ Output: `deploy-output.json` with all resource IDs and SSM access commands.
 - **Node.js 22** from official tarball (verified SHA256)
 - **Gemini 2.0 Flash** — free tier, 1M context, supports tools
 - **No inbound ports** — SSM Session Manager only
-- **Secrets in SSM Parameter Store** — encrypted, never in config files
+- **Secrets sourced from SSM** — sourced at bootstrap, then persisted on-instance in OpenClaw config files
 - **Encrypted EBS** (gp3, 20GB) + IMDSv2 enforced
 - **Cost:** ~$30/mo
 
