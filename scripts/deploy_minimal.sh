@@ -364,7 +364,11 @@ BEDROCK_POLICY=$(cat <<BPOLICY
         "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream"
       ],
-      "Resource": "arn:aws:bedrock:${REGION}::foundation-model/*"
+      "Resource": [
+        "arn:aws:bedrock:${REGION}::foundation-model/*",
+        "arn:aws:bedrock:${REGION}:*:inference-profile/*",
+        "arn:aws:bedrock:${REGION}:*:application-inference-profile/*"
+      ]
     }
   ]
 }
@@ -681,11 +685,14 @@ echo "[$(date)] Bootstrap complete!"
 USERDATA
 )
 
+# JSON-escape MODEL to prevent injection via quotes/backslashes
+MODEL_ESCAPED=$(printf '%s' "$MODEL" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
 # Replace placeholders
 USER_DATA="${USER_DATA//__NAME__/$NAME}"
 USER_DATA="${USER_DATA//__REGION__/$REGION}"
 USER_DATA="${USER_DATA//__NODE_VERSION__/$NODE_VERSION}"
-USER_DATA="${USER_DATA//__MODEL__/$MODEL}"
+USER_DATA="${USER_DATA//__MODEL__/$MODEL_ESCAPED}"
 USER_DATA="${USER_DATA//__HAS_GEMINI_KEY__/$HAS_GEMINI_KEY}"
 USER_DATA="${USER_DATA//__SOUL_B64__/$SOUL_B64}"
 
@@ -795,6 +802,14 @@ fi
 log ""
 log "--- Step 13: Saving deployment outputs ---"
 
+# Build conditional SSM entry for deploy output
+if [[ "$HAS_GEMINI_KEY" == "true" ]]; then
+  GEMINI_SSM_JSON_ENTRY=",
+    \"/${NAME}/gemini/api_key\""
+else
+  GEMINI_SSM_JSON_ENTRY=""
+fi
+
 cat > "$OUTPUT_PATH" <<OUTEOF
 {
   "name": "$NAME",
@@ -819,8 +834,7 @@ cat > "$OUTPUT_PATH" <<OUTEOF
   },
   "ssmParameters": [
     "/${NAME}/telegram/bot_token",
-    "/${NAME}/gemini/api_key",
-    "/${NAME}/gateway/token"
+    "/${NAME}/gateway/token"${GEMINI_SSM_JSON_ENTRY}
   ],
   "config": {
     "model": "$MODEL",

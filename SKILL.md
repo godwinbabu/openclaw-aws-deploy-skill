@@ -1,6 +1,6 @@
 ---
 name: openclaw-aws-deploy
-description: Deploy OpenClaw securely on AWS with a single command. Creates VPC, EC2 (ARM64), Telegram channel, and Gemini Flash model — SSM-only access, no SSH. Use when setting up OpenClaw on AWS, deploying a new agent instance to EC2, or tearing down an existing AWS deployment.
+description: Deploy OpenClaw securely on AWS with a single command. Creates VPC, EC2 (ARM64), Telegram channel, and configurable AI model (Bedrock, Gemini, or any provider) — SSM-only access, no SSH. Use when setting up OpenClaw on AWS, deploying a new agent instance to EC2, or tearing down an existing AWS deployment.
 metadata:
   {
     "openclaw":
@@ -45,7 +45,7 @@ metadata:
 This single command:
 1. Creates VPC + subnet + IGW + route table
 2. Creates security group (NO inbound ports — SSM only)
-3. Creates IAM role with minimal permissions (SSM + Parameter Store)
+3. Creates IAM role with minimal permissions (SSM + Parameter Store + Bedrock)
 4. Stores secrets in SSM Parameter Store (sourced at bootstrap, persisted on-instance in OpenClaw config files)
 5. Launches **t4g.medium** ARM64 instance with user-data bootstrap
 6. User-data installs Node.js 22 + OpenClaw + configures everything
@@ -125,7 +125,7 @@ GEMINI_API_KEY=...         # Optional — from aistudio.google.com (needed for G
 │  │  │  ┌───────────────────────────────────┐  │  │  │
 │  │  │  │       OpenClaw Gateway             │  │  │  │
 │  │  │  │  • Node.js 22.14.0                 │  │  │  │
-│  │  │  │  • Gemini 2.0 Flash (google API)   │  │  │  │
+│  │  │  │  • Any model (Bedrock/Gemini/etc)   │  │  │  │
 │  │  │  │  • Telegram channel                │  │  │  │
 │  │  │  │  • Encrypted EBS (gp3, 20GB)       │  │  │  │
 │  │  │  └───────────────────────────────────┘  │  │  │
