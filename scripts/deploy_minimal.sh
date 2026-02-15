@@ -1015,8 +1015,8 @@ USERDATA
 )
 
 # Validate MODEL — must be a simple model string (no control chars, quotes, or newlines)
-if [[ "$MODEL" =~ [[:cntrl:]] ]] || [[ "$MODEL" == *'"'* ]] || [[ "$MODEL" == *$'\n'* ]]; then
-  echo "ERROR: --model contains invalid characters (quotes, newlines, or control chars)" >&2
+if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
+  echo "ERROR: --model contains invalid characters (allowed: A-Za-z0-9._:/-)" >&2
   exit 1
 fi
 MODEL_ESCAPED="$MODEL"
