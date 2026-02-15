@@ -600,9 +600,11 @@ BEDROCK_POLICY=$(cat <<BPOLICY
       "Effect": "Allow",
       "Action": [
         "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream"
+        "bedrock:InvokeModelWithResponseStream",
+        "bedrock:ListFoundationModels"
       ],
       "Resource": [
+        "*",
         "arn:aws:bedrock:${REGION}::foundation-model/*",
         "arn:aws:bedrock:${REGION}:*:inference-profile/*",
         "arn:aws:bedrock:${REGION}:*:application-inference-profile/*"
@@ -946,16 +948,18 @@ echo "[$(date)] Starting gateway..."
 
 # Start gateway in FOREGROUND mode
 # CRITICAL: Use 'run' not 'start' — start tries systemctl --user which fails
+# AWS_PROFILE=default tells OpenClaw to use the AWS SDK default credential chain (IMDS/instance role)
+# Must be set AFTER SSM calls above (which use IMDS directly without a profile)
+export AWS_PROFILE=default
 exec /usr/local/bin/openclaw gateway run --allow-unconfigured
 STARTEOF
 chmod +x /usr/local/bin/openclaw-startup.sh
 sed -i "s/__REGION__/${REGION}/g" /usr/local/bin/openclaw-startup.sh
-sed -i "s/__NAME__/${NAME}/g" /usr/local/bin/openclaw-startup.sh
+sed -i "s/__NAME__/${AGENT_NAME}/g" /usr/local/bin/openclaw-startup.sh
 sed -i "s/__HAS_GEMINI_KEY__/${HAS_GEMINI_KEY}/g" /usr/local/bin/openclaw-startup.sh
 
-# Escape model string for sed (handle slashes)
-MODEL_SED_ESCAPED=$(echo "$MODEL" | sed 's/[\/&]/\\&/g')
-sed -i "s/__MODEL__/${MODEL_SED_ESCAPED}/g" /usr/local/bin/openclaw-startup.sh
+# Use | delimiter for sed to handle slashes in model paths (e.g. amazon-bedrock/minimax.minimax-m2.1)
+sed -i "s|__MODEL__|${MODEL}|g" /usr/local/bin/openclaw-startup.sh
 
 # Create systemd service (simplified — security hardening removed due to namespace issues)
 echo "[$(date)] Writing systemd service..."
@@ -1011,8 +1015,8 @@ USERDATA
 )
 
 # Validate MODEL — must be a simple model string (no control chars, quotes, or newlines)
-if [[ "$MODEL" =~ [[:cntrl:]] ]] || [[ "$MODEL" == *'"'* ]] || [[ "$MODEL" == *$'\n'* ]]; then
-  echo "ERROR: --model contains invalid characters (quotes, newlines, or control chars)" >&2
+if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
+  echo "ERROR: --model contains invalid characters (allowed: A-Za-z0-9._:/-)" >&2
   exit 1
 fi
 MODEL_ESCAPED="$MODEL"
