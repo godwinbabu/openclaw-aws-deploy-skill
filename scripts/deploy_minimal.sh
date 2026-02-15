@@ -740,7 +740,7 @@ if command -v amazon-cloudwatch-agent-ctl &>/dev/null; then
   }
 }
 CWEOF
-  sed -i "s/__NAME__/'"$AGENT_NAME"'/g" /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+  sed -i "s/__NAME__/${AGENT_NAME}/g" /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
   amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json || true
   echo "[$(date)] CloudWatch agent started"
 else
@@ -849,7 +849,7 @@ cd /home/openclaw/.openclaw
 
 echo "[$(date)] Fetching secrets from SSM Parameter Store..."
 
-# Fetch secrets from SSM at runtime (secrets never persisted on disk)
+# Fetch secrets from SSM at runtime (secrets rewritten on each start, not baked into images)
 TELEGRAM_TOKEN=$(aws ssm get-parameter --region "$AWS_REGION" --name "/${AGENT_NAME}/telegram/bot_token" --with-decryption --query 'Parameter.Value' --output text)
 GW_TOKEN=$(aws ssm get-parameter --region "$AWS_REGION" --name "/${AGENT_NAME}/gateway/token" --with-decryption --query 'Parameter.Value' --output text)
 
@@ -1121,12 +1121,16 @@ if [[ "$MONITORING" == "true" ]]; then
     --threshold 1 \
     --comparison-operator GreaterThanOrEqualToThreshold \
     --treat-missing-data breaching \
-    --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" 2>/dev/null || true
-  STATUS_ALARM_ARN=$(aws_cmd cloudwatch describe-alarms \
-    --alarm-names "$STATUS_ALARM_NAME" \
-    --query 'MetricAlarms[0].AlarmArn' 2>/dev/null) || true
-  [[ -n "$STATUS_ALARM_ARN" && "$STATUS_ALARM_ARN" != "None" ]] && ALARM_ARNS+=("$STATUS_ALARM_ARN")
-  log "  ✅ StatusCheckFailed alarm: $STATUS_ALARM_NAME"
+    --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" 2>/dev/null
+  if [[ $? -eq 0 ]]; then
+    STATUS_ALARM_ARN=$(aws_cmd cloudwatch describe-alarms \
+      --alarm-names "$STATUS_ALARM_NAME" \
+      --query 'MetricAlarms[0].AlarmArn' 2>/dev/null) || true
+    [[ -n "$STATUS_ALARM_ARN" && "$STATUS_ALARM_ARN" != "None" ]] && ALARM_ARNS+=("$STATUS_ALARM_ARN")
+    log "  ✅ StatusCheckFailed alarm: $STATUS_ALARM_NAME"
+  else
+    warn "  Failed to create StatusCheckFailed alarm — check CloudWatch permissions"
+  fi
 
   # CPUUtilization > 90% for 5 min
   CPU_ALARM_NAME="${NAME}-cpu-high"
@@ -1142,20 +1146,27 @@ if [[ "$MONITORING" == "true" ]]; then
     --threshold 90 \
     --comparison-operator GreaterThanThreshold \
     --treat-missing-data missing \
-    --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" 2>/dev/null || true
-  CPU_ALARM_ARN=$(aws_cmd cloudwatch describe-alarms \
-    --alarm-names "$CPU_ALARM_NAME" \
-    --query 'MetricAlarms[0].AlarmArn' 2>/dev/null) || true
-  [[ -n "$CPU_ALARM_ARN" && "$CPU_ALARM_ARN" != "None" ]] && ALARM_ARNS+=("$CPU_ALARM_ARN")
-  log "  ✅ CPUUtilization alarm: $CPU_ALARM_NAME"
+    --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" 2>/dev/null
+  if [[ $? -eq 0 ]]; then
+    CPU_ALARM_ARN=$(aws_cmd cloudwatch describe-alarms \
+      --alarm-names "$CPU_ALARM_NAME" \
+      --query 'MetricAlarms[0].AlarmArn' 2>/dev/null) || true
+    [[ -n "$CPU_ALARM_ARN" && "$CPU_ALARM_ARN" != "None" ]] && ALARM_ARNS+=("$CPU_ALARM_ARN")
+    log "  ✅ CPUUtilization alarm: $CPU_ALARM_NAME"
+  else
+    warn "  Failed to create CPUUtilization alarm — check CloudWatch permissions"
+  fi
 
   # Set up CloudWatch log group with retention (P1 #8)
   log "Creating CloudWatch log group..."
-  aws_raw logs create-log-group --log-group-name "/openclaw/${NAME}" \
-    --tags "$TAG_KEY=$TAG_VALUE,$DEPLOY_TAG_KEY=$DEPLOY_ID" 2>/dev/null || true
-  aws_raw logs put-retention-policy --log-group-name "/openclaw/${NAME}" \
-    --retention-in-days 7 2>/dev/null || true
-  log "  ✅ Log group: /openclaw/${NAME} (7 day retention)"
+  if aws_raw logs create-log-group --log-group-name "/openclaw/${NAME}" \
+    --tags "$TAG_KEY=$TAG_VALUE,$DEPLOY_TAG_KEY=$DEPLOY_ID" 2>/dev/null; then
+    aws_raw logs put-retention-policy --log-group-name "/openclaw/${NAME}" \
+      --retention-in-days 7 2>/dev/null || true
+    log "  ✅ Log group: /openclaw/${NAME} (7 day retention)"
+  else
+    warn "  Failed to create log group — check CloudWatch Logs permissions (logs may already exist)"
+  fi
 fi
 
 ###############################################################################

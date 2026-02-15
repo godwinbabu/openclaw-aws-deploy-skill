@@ -49,7 +49,7 @@ This single command:
 1. Creates VPC + subnet + IGW + route table
 2. Creates security group (NO inbound ports — SSM only)
 3. Creates IAM role with minimal permissions (SSM + Parameter Store + Bedrock)
-4. Stores secrets in SSM Parameter Store (fetched at each service start — never persisted on disk)
+4. Stores secrets in SSM Parameter Store (fetched at each service start — rewritten on each start, never stored in repo or static images)
 5. Launches **t4g.medium** ARM64 instance with user-data bootstrap
 6. User-data installs Node.js 22 + OpenClaw + configures everything
 7. Runs smoke test via SSM
@@ -178,7 +178,7 @@ These are baked into the deploy script. See `references/TROUBLESHOOTING.md` for 
 
 ### Security
 - **No inbound ports** — SSM Session Manager only
-- **Secrets fetched from SSM at runtime** — startup script fetches secrets each time the service starts; config files are ephemeral (never persisted on disk)
+- **Secrets fetched from SSM at runtime** — startup script fetches secrets each time the service starts; config files are ephemeral (rewritten on each start, never stored in repo or static images)
 - **Encrypted EBS** — enabled by default in deploy script
 - **IMDSv2 required** — `HttpTokens=required`
 

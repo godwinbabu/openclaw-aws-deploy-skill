@@ -48,7 +48,6 @@ Options:
   --env-dir <path>        Directory containing .env.aws
   --dry-run               Show what would be deleted, don't delete
   --yes                   Skip confirmation prompt
-  --force                 Bypass multi-deploy safety check when using --name
   -h, --help              Show help
 
 Examples:
@@ -73,7 +72,7 @@ ENV_DIR=""
 FROM_OUTPUT=""
 DRY_RUN=false
 YES=false
-FORCE=false
+
 AWS_PROFILE_FLAG=""
 
 while [[ $# -gt 0 ]]; do
@@ -86,7 +85,6 @@ while [[ $# -gt 0 ]]; do
     --profile) AWS_PROFILE_FLAG="${2:-}"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --yes) YES=true; shift ;;
-    --force) FORCE=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: Unknown arg: $1" >&2; usage; exit 2 ;;
   esac
@@ -299,12 +297,9 @@ else
     DEPLOY_ID_COUNT=$(echo "$ALL_DEPLOY_IDS" | grep -c . || true)
 
     if [[ "$DEPLOY_ID_COUNT" -gt 1 ]]; then
-      if [[ "$FORCE" == "true" ]]; then
-        warn "Multiple deployments found — proceeding anyway (--force)"
-      else
-        fail "Multiple deployments found under Project=$NAME. Use --deploy-id to specify which one, or --force to delete all:
-$(echo "$ALL_DEPLOY_IDS" | sed 's/^/  - /')"
-      fi
+      fail "Multiple deployments found under Project=$NAME. Use --deploy-id to specify which one:
+$(echo "$ALL_DEPLOY_IDS" | sed 's/^/  - /')
+Run teardown separately for each deployment."
     elif [[ "$DEPLOY_ID_COUNT" -eq 1 ]]; then
       DEPLOY_ID="$ALL_DEPLOY_IDS"
       log "Single deployment found: DeployId=$DEPLOY_ID"
