@@ -25,6 +25,7 @@ metadata:
 - `.env.starfish` in workspace root (recommended) or skill directory:
   ```
   TELEGRAM_BOT_TOKEN=...     # from @BotFather (required)
+  TELEGRAM_USER_ID=...       # your Telegram user ID (optional, enables auto-approve pairing)
   GEMINI_API_KEY=...         # from aistudio.google.com (optional, for Gemini models)
   ```
 - `aws` CLI installed OR Docker for sandboxed access
@@ -54,8 +55,11 @@ This single command:
 
 ### After Deploy
 
-1. **Message the Telegram bot** — you'll get a pairing code
-2. **Approve pairing** via SSM:
+**If `TELEGRAM_USER_ID` is set in `.env.starfish`:** Pairing is auto-approved. Just message the bot — it responds immediately! ✅
+
+**If not set (manual pairing):**
+1. Message the Telegram bot — you'll get a pairing code
+2. Approve pairing via SSM:
    ```bash
    aws ssm start-session --target <INSTANCE_ID> --region us-east-1
    sudo -u openclaw bash
@@ -63,6 +67,8 @@ This single command:
    openclaw pairing approve telegram <CODE>
    ```
 3. Bot is live! ✅
+
+**How to find your Telegram user ID:** Message [@userinfobot](https://t.me/userinfobot) on Telegram — it replies with your numeric ID.
 
 ### Teardown
 
@@ -81,12 +87,12 @@ This single command:
 Pass any model string — it goes directly into `openclaw.json` as `model.primary`:
 
 ```bash
-# Default (Gemini Flash — needs GEMINI_API_KEY in .env.starfish)
+# Default (MiniMax M2.1 on Bedrock — no API key needed, uses IAM role)
 ./scripts/deploy_minimal.sh --name starfish --region us-east-1
 
-# Bedrock model (no API key needed — uses IAM role)
+# Gemini Flash (needs GEMINI_API_KEY in .env.starfish)
 ./scripts/deploy_minimal.sh --name starfish --region us-east-1 \
-  --model amazon-bedrock/minimax.minimax-m2.1
+  --model google/gemini-2.0-flash
 ```
 
 ### AWS Bedrock
@@ -110,6 +116,7 @@ If `GEMINI_API_KEY` is present in `.env.starfish`, it's stored in SSM and writte
 ### `.env.starfish`
 ```
 TELEGRAM_BOT_TOKEN=...     # Required — from @BotFather
+TELEGRAM_USER_ID=...       # Optional — auto-approves pairing (no manual SSM step)
 GEMINI_API_KEY=...         # Optional — from aistudio.google.com (needed for Gemini models)
 ```
 
@@ -219,6 +226,68 @@ Simplified for reliability — security hardening removed due to namespace issue
 | Public IP | ~$3.65/mo |
 | Gemini Flash | Free tier / ~$0.30/1M tokens |
 | **Total** | **~$29.78/mo** |
+
+## Troubleshooting
+
+### "No API key found for amazon-bedrock"
+
+**Cause:** OpenClaw's Bedrock support requires a `models.providers` config block in `openclaw.json` with `"auth": "aws-sdk"`. Without this, OpenClaw doesn't know to use the AWS SDK credential chain (instance role/IMDS). An `auth-profiles.json` entry alone is NOT sufficient.
+
+**Fix (automatic in current version):** The deploy script now includes the `models.providers` config with Bedrock provider and `bedrockDiscovery` enabled. If you deployed with an older version, add this to `openclaw.json`:
+
+```bash
+# Via SSM on the instance:
+sudo -u openclaw bash
+cd /home/openclaw/.openclaw
+jq '.models = {
+  "providers": {
+    "amazon-bedrock": {
+      "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "api": "bedrock-converse-stream",
+      "auth": "aws-sdk"
+    }
+  },
+  "bedrockDiscovery": {"enabled": true, "region": "us-east-1"}
+}' openclaw.json > /tmp/oc.json && mv /tmp/oc.json openclaw.json
+chown openclaw:openclaw openclaw.json
+systemctl restart openclaw
+```
+
+**Key insight:** Bedrock uses the AWS SDK default credential chain (env vars → instance role → IMDS), NOT API keys. The startup script must export `AWS_REGION` and `AWS_PROFILE=default` for IMDS detection to work.
+
+### "API rate limit reached" (Gemini)
+
+**Cause:** Gemini free tier has strict rate limits (15 RPM, 1M tokens/day).
+
+**Fix:** Switch to a Bedrock model which uses IAM auth with no rate limit issues:
+```bash
+# Update model in openclaw.json:
+jq '.agents.defaults.model.primary = "amazon-bedrock/minimax.minimax-m2.1"' \
+  /home/openclaw/.openclaw/openclaw.json > /tmp/oc.json
+mv /tmp/oc.json /home/openclaw/.openclaw/openclaw.json
+chown openclaw:openclaw /home/openclaw/.openclaw/openclaw.json
+systemctl restart openclaw
+```
+
+Or redeploy with: `--model amazon-bedrock/minimax.minimax-m2.1` (now the default).
+
+### "Pairing code required" / Bot doesn't respond
+
+**Cause:** Telegram user not approved for the bot.
+
+**Fix (recommended):** Add `TELEGRAM_USER_ID=<your_id>` to `.env.starfish` before deploying — auto-approves pairing.
+
+**Fix (manual):**
+```bash
+aws ssm start-session --target <INSTANCE_ID> --region us-east-1
+sudo -u openclaw HOME=/home/openclaw openclaw pairing approve telegram <CODE>
+```
+
+### Bedrock model returns errors
+
+**Cause:** Bedrock models must be **enabled in the AWS Console** before use. Some models (e.g., Anthropic) require a use-case approval form.
+
+**Fix:** Go to AWS Console → Bedrock → Model access → Enable the model you want to use.
 
 ## Safety Rules
 - Never print secrets in logs

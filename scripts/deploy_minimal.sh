@@ -43,7 +43,7 @@ Options:
   --vpc-cidr <cidr>       VPC CIDR (default: 10.50.0.0/16)
   --subnet-cidr <cidr>    Subnet CIDR (default: 10.50.0.0/24)
   --output <path>         Output JSON file (default: ./deploy-output.json)
-  --model <model>         AI model (default: google/gemini-2.0-flash)
+  --model <model>         AI model (default: amazon-bedrock/minimax.minimax-m2.1)
                           Any model string — passed directly to openclaw.json.
                           Bedrock models use IAM role auth (no API key needed).
                           If GEMINI_API_KEY is in .env.starfish, Gemini auth is set up.
@@ -69,7 +69,7 @@ INSTANCE_TYPE="t4g.medium"
 VPC_CIDR="10.50.0.0/16"
 SUBNET_CIDR="10.50.0.0/24"
 OUTPUT_PATH="./deploy-output.json"
-MODEL="google/gemini-2.0-flash"
+MODEL="amazon-bedrock/minimax.minimax-m2.1"
 DRY_RUN=false
 CLEANUP_FIRST=false
 PERSONALITY="default"
@@ -137,10 +137,22 @@ for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY TELEGRAM_BOT_TOKEN; do
   fi
 done
 
+# Utility functions (must be defined before first use)
+log() { echo "[$(date '+%H:%M:%S')] $*"; }
+aws_cmd() { aws --region "$REGION" --output text "$@"; }
+aws_json() { aws --region "$REGION" --output json "$@"; }
+
 # Check optional GEMINI_API_KEY
 HAS_GEMINI_KEY=false
 if [[ -n "${GEMINI_API_KEY:-}" ]]; then
   HAS_GEMINI_KEY=true
+fi
+
+# Check optional TELEGRAM_USER_ID (for auto-approve pairing)
+HAS_TELEGRAM_USER_ID=false
+if [[ -n "${TELEGRAM_USER_ID:-}" ]]; then
+  HAS_TELEGRAM_USER_ID=true
+  log "Telegram user ID found — will auto-approve pairing after deploy"
 fi
 
 # Resolve personality file
@@ -165,10 +177,6 @@ SOUL_B64=$(echo "$SOUL_CONTENT" | base64)
 
 # Generate a gateway token
 GATEWAY_TOKEN=$(openssl rand -hex 32)
-
-log() { echo "[$(date '+%H:%M:%S')] $*"; }
-aws_cmd() { aws --region "$REGION" --output text "$@"; }
-aws_json() { aws --region "$REGION" --output json "$@"; }
 
 TAG_KEY="Project"
 TAG_VALUE="$NAME"
@@ -362,7 +370,8 @@ BEDROCK_POLICY=$(cat <<BPOLICY
       "Effect": "Allow",
       "Action": [
         "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream"
+        "bedrock:InvokeModelWithResponseStream",
+        "bedrock:ListFoundationModels"
       ],
       "Resource": [
         "arn:aws:bedrock:${REGION}::foundation-model/*",
@@ -578,6 +587,28 @@ cat > /home/openclaw/.openclaw/openclaw.json <<OCEOF
       }
     }
   },
+  "models": {
+    "providers": {
+      "amazon-bedrock": {
+        "baseUrl": "https://bedrock-runtime.${REGION}.amazonaws.com",
+        "api": "bedrock-converse-stream",
+        "auth": "aws-sdk",
+        "models": [
+          {
+            "id": "minimax.minimax-m2.1",
+            "name": "MiniMax M2.1",
+            "input": ["text"],
+            "contextWindow": 128000,
+            "maxTokens": 4096
+          }
+        ]
+      }
+    },
+    "bedrockDiscovery": {
+      "enabled": true,
+      "region": "${REGION}"
+    }
+  },
   "tools": {
     "agentToAgent": {
       "enabled": true
@@ -586,13 +617,18 @@ cat > /home/openclaw/.openclaw/openclaw.json <<OCEOF
 }
 OCEOF
 
-# Create auth profiles
+# Create auth profiles (always include Bedrock for IAM-based access)
 echo "[$(date)] Writing auth-profiles.json..."
 if [[ "$HAS_GEMINI_KEY" == "true" ]]; then
   cat > /home/openclaw/.openclaw/agents/main/agent/auth-profiles.json <<APEOF
 {
   "version": 1,
   "profiles": {
+    "amazon-bedrock:default": {
+      "type": "aws",
+      "provider": "amazon-bedrock",
+      "awsRegion": "${REGION}"
+    },
     "google:default": {
       "type": "token",
       "provider": "google",
@@ -602,11 +638,16 @@ if [[ "$HAS_GEMINI_KEY" == "true" ]]; then
 }
 APEOF
 else
-  # No Gemini key — Bedrock/other providers use IAM or external auth
   cat > /home/openclaw/.openclaw/agents/main/agent/auth-profiles.json <<APEOF
 {
   "version": 1,
-  "profiles": {}
+  "profiles": {
+    "amazon-bedrock:default": {
+      "type": "aws",
+      "provider": "amazon-bedrock",
+      "awsRegion": "${REGION}"
+    }
+  }
 }
 APEOF
 fi
@@ -657,9 +698,10 @@ SyslogIdentifier=openclaw
 WantedBy=multi-user.target
 SVCEOF
 
-# Write SOUL.md (personality) to workspace
+# Write SOUL.md (personality) to workspace AND agent directory
 echo "[$(date)] Writing SOUL.md (personality)..."
 echo "__SOUL_B64__" | base64 -d > /home/openclaw/.openclaw/workspace/SOUL.md
+cp /home/openclaw/.openclaw/workspace/SOUL.md /home/openclaw/.openclaw/agents/main/agent/SOUL.md
 
 # Fix ownership
 chown -R openclaw:openclaw /home/openclaw/.openclaw
@@ -866,11 +908,33 @@ log "  Channel:   Telegram (@${NAME} bot)"
 log ""
 log "  SSM Access:"
 log "    aws ssm start-session --target $INSTANCE_ID --region $REGION"
-log ""
-log "  Next steps:"
-log "    1. Message the Telegram bot to get a pairing code"
-log "    2. Approve pairing via SSM:"
-log "       openclaw pairing approve telegram <CODE>"
+if [[ "$HAS_TELEGRAM_USER_ID" == "true" ]]; then
+  log ""
+  log "  --- Auto-approving Telegram pairing for user $TELEGRAM_USER_ID ---"
+  APPROVE_CMD_ID=$(aws ssm send-command --region "$REGION" \
+    --instance-ids "$INSTANCE_ID" \
+    --document-name "AWS-RunShellScript" \
+    --parameters "{\"commands\":[\"sudo -u openclaw HOME=/home/openclaw /usr/local/bin/openclaw pairing add telegram $TELEGRAM_USER_ID\"]}" \
+    --query 'Command.CommandId' --output text 2>/dev/null || true)
+  if [[ -n "$APPROVE_CMD_ID" ]]; then
+    sleep 5
+    APPROVE_RESULT=$(aws ssm get-command-invocation --region "$REGION" \
+      --command-id "$APPROVE_CMD_ID" --instance-id "$INSTANCE_ID" \
+      --query 'StandardOutputContent' --output text 2>/dev/null || echo "unknown")
+    log "  Pairing result: $APPROVE_RESULT"
+  fi
+  log ""
+  log "  ✅ Telegram user $TELEGRAM_USER_ID pre-approved!"
+  log "  Just message the bot — it will respond immediately."
+else
+  log ""
+  log "  Next steps:"
+  log "    1. Message the Telegram bot to get a pairing code"
+  log "    2. Approve pairing via SSM:"
+  log "       openclaw pairing approve telegram <CODE>"
+  log ""
+  log "  TIP: Add TELEGRAM_USER_ID=<your_id> to .env.starfish for auto-approval"
+fi
 log ""
 log "  Output saved to: $OUTPUT_PATH"
 log "=========================================="
