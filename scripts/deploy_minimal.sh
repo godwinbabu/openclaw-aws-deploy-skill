@@ -13,7 +13,8 @@ set -euo pipefail
 #   3. Environment/SSO    — uses existing AWS credentials (env vars, SSO, role)
 #
 # Prerequisites:
-#   - .env.starfish (TELEGRAM_BOT_TOKEN, optionally GEMINI_API_KEY)
+#   - .env.<name> or .env.starfish (TELEGRAM_BOT_TOKEN, optionally GEMINI_API_KEY)
+#     Looks for .env.<name> first, falls back to .env.starfish
 #     In the workspace root (parent of skill repo, or specified via --env-dir)
 #
 # Usage:
@@ -71,10 +72,29 @@ Options:
                           coder, companion — or path to custom SOUL.md
   --az <zone>             Availability zone (e.g. us-east-1a). Auto-selects if not set.
   --no-rollback           Don't auto-teardown on failure (for debugging)
+  --pair-user <id>        Telegram user ID to auto-approve pairing after deploy
   --no-monitoring         Skip CloudWatch alarms and log shipping
   --dry-run               Show what would be created without creating
   --cleanup-first         Tear down existing resources with same name first
   -h, --help              Show this help
+
+Examples:
+  # Basic deploy with defaults (Gemini Flash, us-east-1)
+  $0 --name starfish
+
+  # Deploy with a Bedrock model (no API key needed)
+  $0 --name starfish --model amazon-bedrock/deepseek.deepseek-r1
+
+  # Deploy with a specific AWS profile
+  $0 --name starfish --profile my-aws-profile --region eu-west-1
+
+  # Deploy and auto-approve Telegram pairing
+  $0 --name starfish --pair-user 123456789
+
+Environment files:
+  The script looks for .env.<name> first (e.g. .env.starfish when --name is
+  starfish), falling back to .env.starfish for backward compatibility.
+  Override the search directory with --env-dir.
 USAGE
 }
 
@@ -94,6 +114,7 @@ AWS_PROFILE_FLAG=""
 NO_ROLLBACK=false
 MONITORING=true
 AZ_OVERRIDE=""
+PAIR_USER=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -108,6 +129,7 @@ while [[ $# -gt 0 ]]; do
     --personality) PERSONALITY="${2:-}"; shift 2 ;;
     --profile) AWS_PROFILE_FLAG="${2:-}"; shift 2 ;;
     --az) AZ_OVERRIDE="${2:-}"; shift 2 ;;
+    --pair-user) PAIR_USER="${2:-}"; shift 2 ;;
     --no-rollback) NO_ROLLBACK=true; shift ;;
     --no-monitoring) MONITORING=false; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
@@ -167,25 +189,49 @@ if ! aws_cmd sts get-caller-identity --query 'Account' >/dev/null 2>&1; then
   exit 1
 fi
 
-# Find .env.starfish (still required)
-if [[ -z "$ENV_DIR" ]]; then
-  if [[ -f "$SKILL_DIR/../.env.starfish" ]]; then
-    ENV_DIR="$(cd "$SKILL_DIR/.." && pwd)"
-  elif [[ -f "$SKILL_DIR/.env.starfish" ]]; then
-    ENV_DIR="$(cd "$SKILL_DIR" && pwd)"
+# Find .env.<name> (or fall back to .env.starfish for backward compatibility)
+ENV_FILE=".env.${NAME}"
+ENV_FALLBACK=".env.starfish"
+
+resolve_env_file() {
+  local dir="$1"
+  if [[ -f "$dir/$ENV_FILE" ]]; then
+    echo "$dir/$ENV_FILE"
+  elif [[ -f "$dir/$ENV_FALLBACK" ]]; then
+    echo "$dir/$ENV_FALLBACK"
   else
-    echo "ERROR: Cannot find .env.starfish. Provide --env-dir" >&2
+    echo ""
+  fi
+}
+
+RESOLVED_ENV=""
+if [[ -z "$ENV_DIR" ]]; then
+  RESOLVED_ENV=$(resolve_env_file "$SKILL_DIR/..")
+  if [[ -n "$RESOLVED_ENV" ]]; then
+    ENV_DIR="$(cd "$SKILL_DIR/.." && pwd)"
+  else
+    RESOLVED_ENV=$(resolve_env_file "$SKILL_DIR")
+    if [[ -n "$RESOLVED_ENV" ]]; then
+      ENV_DIR="$(cd "$SKILL_DIR" && pwd)"
+    else
+      echo "ERROR: Cannot find $ENV_FILE (or $ENV_FALLBACK). Provide --env-dir" >&2
+      exit 1
+    fi
+  fi
+else
+  RESOLVED_ENV=$(resolve_env_file "$ENV_DIR")
+  if [[ -z "$RESOLVED_ENV" ]]; then
+    echo "ERROR: Neither $ENV_DIR/$ENV_FILE nor $ENV_DIR/$ENV_FALLBACK found" >&2
     exit 1
   fi
-elif [[ ! -f "$ENV_DIR/.env.starfish" ]]; then
-  echo "ERROR: $ENV_DIR/.env.starfish not found" >&2
-  exit 1
 fi
 
-# Load starfish env
+log "Env file: $RESOLVED_ENV"
+
+# Load env file
 while IFS='=' read -r key value; do
   export "$key=$value"
-done < <(grep -E '^[A-Z0-9_]+=' "$ENV_DIR/.env.starfish")
+done < <(grep -E '^[A-Z0-9_]+=' "$RESOLVED_ENV")
 
 # Validate required vars (only Telegram token — AWS keys are no longer hard-required)
 if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
@@ -1183,6 +1229,44 @@ if [[ -n "$SMOKE_ID" ]]; then
 fi
 
 ###############################################################################
+# Step 12b: Auto-approve pairing (if --pair-user provided)
+###############################################################################
+if [[ -n "$PAIR_USER" ]]; then
+  log ""
+  log "--- Step 12b: Auto-approving Telegram pairing for user $PAIR_USER ---"
+  log "Waiting 30s for gateway to register pairing request..."
+  sleep 30
+
+  PAIR_CMD="sudo -u openclaw bash -c 'cd /home/openclaw/.openclaw && /usr/local/bin/openclaw pairing approve telegram $PAIR_USER'"
+  PAIR_ID=$(aws_raw ssm send-command \
+    --instance-ids "$INSTANCE_ID" \
+    --document-name "AWS-RunShellScript" \
+    --parameters "commands=[\"$PAIR_CMD\"]" \
+    --query 'Command.CommandId' --output text 2>/dev/null) || true
+
+  if [[ -n "$PAIR_ID" ]]; then
+    sleep 10
+    PAIR_OUT=$(aws_raw ssm get-command-invocation \
+      --command-id "$PAIR_ID" --instance-id "$INSTANCE_ID" \
+      --query 'StandardOutputContent' --output text 2>/dev/null) || true
+    PAIR_ERR=$(aws_raw ssm get-command-invocation \
+      --command-id "$PAIR_ID" --instance-id "$INSTANCE_ID" \
+      --query 'StandardErrorContent' --output text 2>/dev/null) || true
+
+    if [[ -n "$PAIR_OUT" ]]; then
+      log "Pairing output: $PAIR_OUT"
+    fi
+    if [[ -n "$PAIR_ERR" && "$PAIR_ERR" != "None" ]]; then
+      warn "Pairing stderr: $PAIR_ERR"
+    fi
+    log "Auto-pairing command sent. If the user hasn't messaged the bot yet,"
+    log "they can message it and you can re-run pairing via SSM."
+  else
+    warn "Failed to send pairing command via SSM"
+  fi
+fi
+
+###############################################################################
 # Step 13: Save outputs
 ###############################################################################
 log ""
@@ -1267,10 +1351,14 @@ log ""
 log "  SSM Access:"
 log "    aws ssm start-session --target $INSTANCE_ID --region $REGION"
 log ""
-log "  Next steps:"
-log "    1. Message the Telegram bot to get a pairing code"
-log "    2. Approve pairing via SSM:"
-log "       openclaw pairing approve telegram <CODE>"
+if [[ -n "$PAIR_USER" ]]; then
+  log "  Pairing: auto-approved for Telegram user $PAIR_USER"
+else
+  log "  Next steps:"
+  log "    1. Message the Telegram bot to get a pairing code"
+  log "    2. Approve pairing via SSM:"
+  log "       openclaw pairing approve telegram <CODE>"
+fi
 log ""
 log "  Output saved to: $OUTPUT_PATH"
 log "=========================================="

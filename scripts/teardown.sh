@@ -50,6 +50,19 @@ Options:
   --yes                   Skip confirmation prompt
   --force                 Bypass multi-deploy safety check when using --name
   -h, --help              Show help
+
+Examples:
+  # Preview what would be deleted (safe — no changes)
+  $0 --name starfish --dry-run
+
+  # Teardown using deploy output file (most precise)
+  $0 --from-output ./deploy-output.json --yes
+
+  # Teardown by deploy ID
+  $0 --deploy-id starfish-20260215T143000Z --region us-east-1 --yes
+
+  # Teardown with a specific AWS profile
+  $0 --name starfish --profile my-aws-profile --yes
 USAGE
 }
 

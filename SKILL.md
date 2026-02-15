@@ -13,7 +13,7 @@ metadata:
 
 # OpenClaw AWS Deploy Skill
 
-## Quick Start (Minimal Deployment ~$25/mo)
+## Quick Start (Minimal Deployment ~$30/mo)
 
 ### Prerequisites
 - **AWS credentials** — any of these methods:
@@ -209,7 +209,7 @@ Create at `~/.openclaw/agents/main/agent/auth-profiles.json`
 ### Systemd Service (openclaw.service)
 Simplified for reliability — security hardening removed due to namespace issues.
 
-## Cost Breakdown (~$25/mo)
+## Cost Breakdown (~$30/mo)
 | Resource | Cost |
 |----------|------|
 | t4g.medium (4GB ARM64) | ~$24.53/mo |
