@@ -18,7 +18,6 @@ set -euo pipefail
 #   - --dry-run shows what would be deleted without deleting
 #   - Tag verification before each EC2 resource deletion (fails closed)
 #   - Ambiguity detection: --name mode fails if multiple DeployIds found
-#   - --force flag to bypass multi-deploy safety check
 #   - Fail loudly on real API errors (not-found is non-fatal)
 #   - Confirmation prompt unless --yes is passed
 #
@@ -529,11 +528,20 @@ if [[ -n "$IAM_ROLE" || -n "$INSTANCE_PROFILE" ]]; then
   fi
 
   if [[ -n "$IAM_ROLE" ]]; then
+    # Delete all known inline policies
     for policy in SSMParameterAccess SSMAccess BedrockAccess BedrockFullAccess CloudWatchAccess; do
       aws_with_region iam delete-role-policy --role-name "$IAM_ROLE" --policy-name "$policy" 2>/dev/null || true
     done
-    aws_with_region iam detach-role-policy --role-name "$IAM_ROLE" \
-      --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 2>/dev/null || true
+    # Also dynamically list and delete any remaining inline policies
+    REMAINING_POLICIES=$(aws_with_region iam list-role-policies --role-name "$IAM_ROLE" --query 'PolicyNames[]' --output text 2>/dev/null || true)
+    for policy in $REMAINING_POLICIES; do
+      aws_with_region iam delete-role-policy --role-name "$IAM_ROLE" --policy-name "$policy" 2>/dev/null || true
+    done
+    # Detach all managed policies (not just the known one)
+    ATTACHED_ARNS=$(aws_with_region iam list-attached-role-policies --role-name "$IAM_ROLE" --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || true)
+    for arn in $ATTACHED_ARNS; do
+      aws_with_region iam detach-role-policy --role-name "$IAM_ROLE" --policy-arn "$arn" 2>/dev/null || true
+    done
     delete_resource "IAM Role: $IAM_ROLE" \
       aws_with_region iam delete-role --role-name "$IAM_ROLE"
   fi
