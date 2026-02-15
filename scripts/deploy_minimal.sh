@@ -953,9 +953,8 @@ sed -i "s/__REGION__/${REGION}/g" /usr/local/bin/openclaw-startup.sh
 sed -i "s/__NAME__/${AGENT_NAME}/g" /usr/local/bin/openclaw-startup.sh
 sed -i "s/__HAS_GEMINI_KEY__/${HAS_GEMINI_KEY}/g" /usr/local/bin/openclaw-startup.sh
 
-# Escape model string for sed (handle slashes)
-MODEL_SED_ESCAPED=$(echo "$MODEL" | sed 's/[\/&]/\\&/g')
-sed -i "s/__MODEL__/${MODEL_SED_ESCAPED}/g" /usr/local/bin/openclaw-startup.sh
+# Use | delimiter for sed to handle slashes in model paths (e.g. amazon-bedrock/minimax.minimax-m2.1)
+sed -i "s|__MODEL__|${MODEL}|g" /usr/local/bin/openclaw-startup.sh
 
 # Create systemd service (simplified — security hardening removed due to namespace issues)
 echo "[$(date)] Writing systemd service..."
