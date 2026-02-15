@@ -9,10 +9,16 @@ set -euo pipefail
 #   2. --deploy-id <id>                     (unique deploy tag)
 #   3. --name <name>                        (project tag, may match multiple deploys)
 #
+# AWS Authentication (in priority order):
+#   1. --profile <name>   — uses named AWS CLI profile
+#   2. .env.aws file      — loads AWS_ACCESS_KEY_ID/SECRET (if found)
+#   3. Environment/SSO    — uses existing AWS credentials
+#
 # Safety features:
 #   - --dry-run shows what would be deleted without deleting
-#   - Tag verification before each EC2 resource deletion
+#   - Tag verification before each EC2 resource deletion (fails closed)
 #   - Ambiguity detection: --name mode fails if multiple DeployIds found
+#   - --force flag to bypass multi-deploy safety check
 #   - Fail loudly on real API errors (not-found is non-fatal)
 #   - Confirmation prompt unless --yes is passed
 #
@@ -20,6 +26,7 @@ set -euo pipefail
 #   ./scripts/teardown.sh --name starfish --dry-run
 #   ./scripts/teardown.sh --deploy-id starfish-20260215T143000Z --yes
 #   ./scripts/teardown.sh --from-output ./deploy-output.json --yes
+#   ./scripts/teardown.sh --name starfish --profile my-aws-profile --yes
 ###############################################################################
 
 usage() {
@@ -28,14 +35,20 @@ Usage: $0 [options]
 
 Discovery (at least one required):
   --name <name>           Find resources by Project=<name> tag
+                          ⚠️  May affect multiple deployments — prefer --deploy-id
   --deploy-id <id>        Find resources by DeployId=<id> tag (most precise)
   --from-output <path>    Read resource IDs from deploy-output.json
+
+AWS Authentication:
+  --profile <name>        Use a named AWS CLI profile
+  (no flag)               Uses .env.aws if found, else existing env/SSO/role creds
 
 Options:
   --region <region>       AWS region (default: us-east-1)
   --env-dir <path>        Directory containing .env.aws
   --dry-run               Show what would be deleted, don't delete
   --yes                   Skip confirmation prompt
+  --force                 Bypass multi-deploy safety check when using --name
   -h, --help              Show help
 USAGE
 }
@@ -47,6 +60,8 @@ ENV_DIR=""
 FROM_OUTPUT=""
 DRY_RUN=false
 YES=false
+FORCE=false
+AWS_PROFILE_FLAG=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -55,8 +70,10 @@ while [[ $# -gt 0 ]]; do
     --region) REGION="${2:-}"; shift 2 ;;
     --env-dir) ENV_DIR="${2:-}"; shift 2 ;;
     --from-output) FROM_OUTPUT="${2:-}"; shift 2 ;;
+    --profile) AWS_PROFILE_FLAG="${2:-}"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --yes) YES=true; shift ;;
+    --force) FORCE=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: Unknown arg: $1" >&2; usage; exit 2 ;;
   esac
@@ -78,24 +95,40 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Find .env.aws
-if [[ -z "$ENV_DIR" ]]; then
-  if [[ -f "$SKILL_DIR/../.env.aws" ]]; then
-    ENV_DIR="$SKILL_DIR/.."
-  elif [[ -f "$SKILL_DIR/.env.aws" ]]; then
-    ENV_DIR="$SKILL_DIR"
-  else
-    echo "ERROR: Cannot find .env.aws. Provide --env-dir" >&2
-    exit 1
+###############################################################################
+# AWS Authentication Chain (same as deploy)
+###############################################################################
+if [[ -n "$AWS_PROFILE_FLAG" ]]; then
+  aws_with_region() { aws --region "$REGION" --profile "$AWS_PROFILE_FLAG" "$@"; }
+else
+  # Try loading .env.aws if available
+  if [[ -z "$ENV_DIR" ]]; then
+    if [[ -f "$SKILL_DIR/../.env.aws" ]]; then
+      ENV_DIR="$SKILL_DIR/.."
+    elif [[ -f "$SKILL_DIR/.env.aws" ]]; then
+      ENV_DIR="$SKILL_DIR"
+    fi
   fi
+
+  if [[ -n "$ENV_DIR" ]]; then
+    ENV_DIR="$(cd "$ENV_DIR" && pwd)"
+  fi
+
+  if [[ -n "$ENV_DIR" && -f "$ENV_DIR/.env.aws" ]]; then
+    while IFS='=' read -r key value; do
+      export "$key=$value"
+    done < <(grep -E '^[A-Z0-9_]+=' "$ENV_DIR/.env.aws")
+  fi
+  export AWS_DEFAULT_REGION="$REGION"
+
+  aws_with_region() { aws --region "$REGION" "$@"; }
 fi
 
-# Secure env parsing
-ENV_DIR="$(cd "$ENV_DIR" && pwd)"
-while IFS='=' read -r key value; do
-  export "$key=$value"
-done < <(grep -E '^[A-Z0-9_]+=' "$ENV_DIR/.env.aws")
-export AWS_DEFAULT_REGION="$REGION"
+# Verify AWS credentials work
+if ! aws_with_region sts get-caller-identity --output text --query 'Account' >/dev/null 2>&1; then
+  echo "ERROR: AWS credentials not valid. Provide --profile, set up .env.aws, or configure AWS SSO/env." >&2
+  exit 1
+fi
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 warn() { echo "[$(date '+%H:%M:%S')] ⚠️  $*" >&2; }
@@ -110,7 +143,7 @@ aws_query() {
   local result=""
   local exit_code=0
 
-  result=$(aws --region "$REGION" --output text "$@" 2>"$stderr_file") || exit_code=$?
+  result=$(aws_with_region --output text "$@" 2>"$stderr_file") || exit_code=$?
 
   if [[ $exit_code -ne 0 ]]; then
     local stderr_content
@@ -142,8 +175,7 @@ aws_query() {
 
 ###############################################################################
 # verify_tags — Check that an EC2 resource has expected tags before deletion
-# Usage: verify_tags <resource-id> [expected-project] [expected-deploy-id]
-# Returns 0 if tags match, 1 if mismatch
+# Returns 0 if tags match, 1 if mismatch or API error (FAIL CLOSED — P0 #3)
 ###############################################################################
 verify_tags() {
   local resource_id="$1"
@@ -156,9 +188,16 @@ verify_tags() {
   fi
 
   local tags
-  tags=$(aws ec2 describe-tags --region "$REGION" --output text \
+  tags=$(aws_with_region ec2 describe-tags --output text \
     --filters "Name=resource-id,Values=$resource_id" \
-    --query 'Tags[].{Key:Key,Value:Value}' 2>/dev/null) || return 0
+    --query 'Tags[].{Key:Key,Value:Value}' 2>/dev/null)
+  local tag_exit=$?
+
+  # FAIL CLOSED: if the API call fails, refuse to delete (P0 #3)
+  if [[ $tag_exit -ne 0 ]]; then
+    warn "Tag verification API call failed for $resource_id — refusing to delete (fail closed)"
+    return 1
+  fi
 
   if [[ -n "$expected_project" ]]; then
     if ! echo "$tags" | grep -q "Project.*$expected_project"; then
@@ -190,6 +229,8 @@ RTB_ID=""
 IAM_ROLE=""
 INSTANCE_PROFILE=""
 SSM_PARAMS=()
+CW_ALARM_NAMES=()
+CW_LOG_GROUP=""
 
 if [[ -n "$FROM_OUTPUT" ]]; then
   # Mode 1: From deploy output file (most precise — exact IDs)
@@ -213,6 +254,9 @@ if [[ -n "$FROM_OUTPUT" ]]; then
     [[ -n "$param" ]] && SSM_PARAMS+=("$param")
   done < <(jq -r '.ssmParameters[]? // empty' "$FROM_OUTPUT")
 
+  # Read monitoring resources if present
+  CW_LOG_GROUP=$(jq -r '.monitoring.logGroup // empty' "$FROM_OUTPUT" 2>/dev/null) || true
+
 else
   # Mode 2/3: Discover by tag
   if [[ -n "$DEPLOY_ID" ]]; then
@@ -221,19 +265,20 @@ else
   else
     TAG_FILTER="Name=tag:Project,Values=$NAME"
     log "Discovering resources by Project=$NAME"
+
+    # P1 #10: Safer teardown defaults — warn when using --name
+    warn "Using --name mode — this may affect ALL deployments tagged Project=$NAME"
+    warn "For precise cleanup, use --deploy-id or --from-output instead"
   fi
 
   # --- Ambiguity check for --name mode ---
-  # If using --name, check if multiple DeployIds exist under this project tag.
-  # If so, refuse to proceed and list them for the user.
   if [[ -z "$DEPLOY_ID" && -n "$NAME" ]]; then
     log "Checking for deployment ambiguity..."
-    DEPLOY_IDS_RAW=$(aws ec2 describe-instances --region "$REGION" --output text \
+    DEPLOY_IDS_RAW=$(aws_with_region ec2 describe-instances --output text \
       --filters "Name=tag:Project,Values=$NAME" "Name=instance-state-name,Values=running,stopped,pending,stopping" \
       --query 'Reservations[].Instances[].Tags[?Key==`DeployId`].Value[]' 2>/dev/null) || true
 
-    # Also check VPCs for DeployId tags (instances may be terminated)
-    VPC_DEPLOY_IDS=$(aws ec2 describe-vpcs --region "$REGION" --output text \
+    VPC_DEPLOY_IDS=$(aws_with_region ec2 describe-vpcs --output text \
       --filters "Name=tag:Project,Values=$NAME" \
       --query 'Vpcs[].Tags[?Key==`DeployId`].Value[]' 2>/dev/null) || true
 
@@ -241,21 +286,22 @@ else
     DEPLOY_ID_COUNT=$(echo "$ALL_DEPLOY_IDS" | grep -c . || true)
 
     if [[ "$DEPLOY_ID_COUNT" -gt 1 ]]; then
-      fail "Multiple deployments found under Project=$NAME. Use --deploy-id to specify which one:
+      if [[ "$FORCE" == "true" ]]; then
+        warn "Multiple deployments found — proceeding anyway (--force)"
+      else
+        fail "Multiple deployments found under Project=$NAME. Use --deploy-id to specify which one, or --force to delete all:
 $(echo "$ALL_DEPLOY_IDS" | sed 's/^/  - /')"
+      fi
     elif [[ "$DEPLOY_ID_COUNT" -eq 1 ]]; then
       DEPLOY_ID="$ALL_DEPLOY_IDS"
       log "Single deployment found: DeployId=$DEPLOY_ID"
-      # Narrow filter to this specific deploy
       TAG_FILTER="Name=tag:DeployId,Values=$DEPLOY_ID"
     fi
   fi
 
   # --- Resolve NAME from DeployId if not provided ---
-  # DeployId format is "{name}-{YYYYMMDDTHHMMSSZ}", so strip the timestamp suffix
   if [[ -z "$NAME" && -n "$DEPLOY_ID" ]]; then
-    # Try to resolve from a discovered resource's Project tag first
-    DISCOVERED_PROJECT=$(aws ec2 describe-vpcs --region "$REGION" --output text \
+    DISCOVERED_PROJECT=$(aws_with_region ec2 describe-vpcs --output text \
       --filters "Name=tag:DeployId,Values=$DEPLOY_ID" \
       --query 'Vpcs[0].Tags[?Key==`Project`].Value | [0]' 2>/dev/null) || true
 
@@ -263,7 +309,6 @@ $(echo "$ALL_DEPLOY_IDS" | sed 's/^/  - /')"
       NAME="$DISCOVERED_PROJECT"
       log "Resolved NAME from VPC tag: $NAME"
     else
-      # Fallback: parse from DeployId format (name-YYYYMMDDTHHMMSSz)
       NAME=$(echo "$DEPLOY_ID" | sed 's/-[0-9]\{8\}T[0-9]\{6\}Z$//')
       if [[ -n "$NAME" && "$NAME" != "$DEPLOY_ID" ]]; then
         log "Resolved NAME from DeployId format: $NAME"
@@ -308,16 +353,22 @@ $(echo "$ALL_DEPLOY_IDS" | sed 's/^/  - /')"
       --query 'RouteTables[0].RouteTableId') || true
   fi
 
-  # IAM + SSM (derive from NAME — skip if NAME couldn't be resolved)
+  # IAM + SSM (derive from NAME)
   if [[ -n "$NAME" ]]; then
     IAM_ROLE="${NAME}-role"
     INSTANCE_PROFILE="${NAME}-instance-profile"
     SSM_PARAMS=("/${NAME}/telegram/bot_token" "/${NAME}/gemini/api_key" "/${NAME}/gateway/token" "/${NAME}/openrouter/api_key")
+    CW_LOG_GROUP="/openclaw/${NAME}"
   else
     IAM_ROLE=""
     INSTANCE_PROFILE=""
     SSM_PARAMS=()
   fi
+fi
+
+# Discover CloudWatch alarms by tag
+if [[ -n "$NAME" ]]; then
+  CW_ALARM_NAMES=("${NAME}-status-check-failed" "${NAME}-cpu-high")
 fi
 
 ###############################################################################
@@ -360,6 +411,10 @@ print_resource "Instance Prof" "$INSTANCE_PROFILE"
 for param in "${SSM_PARAMS[@]}"; do
   print_resource "SSM Param" "$param"
 done
+for alarm in "${CW_ALARM_NAMES[@]}"; do
+  print_resource "CW Alarm" "$alarm"
+done
+[[ -n "$CW_LOG_GROUP" ]] && print_resource "CW Log Group" "$CW_LOG_GROUP"
 
 log ""
 log "  Total: $RESOURCE_COUNT resources (💰 = billable)"
@@ -433,9 +488,9 @@ if [[ -n "$INSTANCE_ID" ]]; then
     warn "  SKIPPED (tag mismatch): Instance $INSTANCE_ID"
     ERRORS=$((ERRORS + 1))
   else
-    aws ec2 terminate-instances --region "$REGION" --instance-ids "$INSTANCE_ID" > /dev/null 2>&1 || true
+    aws_with_region ec2 terminate-instances --instance-ids "$INSTANCE_ID" > /dev/null 2>&1 || true
     log "  Waiting for termination (this may take 1-2 min)..."
-    if ! aws ec2 wait instance-terminated --region "$REGION" --instance-ids "$INSTANCE_ID" 2>/dev/null; then
+    if ! aws_with_region ec2 wait instance-terminated --instance-ids "$INSTANCE_ID" 2>/dev/null; then
       warn "  Timeout waiting for termination — continuing anyway"
       sleep 30
     fi
@@ -448,7 +503,7 @@ if [[ ${#SSM_PARAMS[@]} -gt 0 ]]; then
   log ""
   log "--- Step 2: Delete SSM parameters ---"
   for param in "${SSM_PARAMS[@]}"; do
-    delete_resource "SSM: $param" aws ssm delete-parameter --region "$REGION" --name "$param"
+    delete_resource "SSM: $param" aws_with_region ssm delete-parameter --name "$param"
   done
 fi
 
@@ -458,80 +513,94 @@ if [[ -n "$IAM_ROLE" || -n "$INSTANCE_PROFILE" ]]; then
   log "--- Step 3: Clean up IAM ---"
 
   if [[ -n "$INSTANCE_PROFILE" ]]; then
-    aws iam remove-role-from-instance-profile \
+    aws_with_region iam remove-role-from-instance-profile \
       --instance-profile-name "$INSTANCE_PROFILE" \
       --role-name "$IAM_ROLE" 2>/dev/null || true
     delete_resource "Instance Profile: $INSTANCE_PROFILE" \
-      aws iam delete-instance-profile --instance-profile-name "$INSTANCE_PROFILE"
+      aws_with_region iam delete-instance-profile --instance-profile-name "$INSTANCE_PROFILE"
   fi
 
   if [[ -n "$IAM_ROLE" ]]; then
-    for policy in SSMParameterAccess SSMAccess BedrockFullAccess; do
-      aws iam delete-role-policy --role-name "$IAM_ROLE" --policy-name "$policy" 2>/dev/null || true
+    for policy in SSMParameterAccess SSMAccess BedrockAccess BedrockFullAccess CloudWatchAccess; do
+      aws_with_region iam delete-role-policy --role-name "$IAM_ROLE" --policy-name "$policy" 2>/dev/null || true
     done
-    aws iam detach-role-policy --role-name "$IAM_ROLE" \
+    aws_with_region iam detach-role-policy --role-name "$IAM_ROLE" \
       --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 2>/dev/null || true
     delete_resource "IAM Role: $IAM_ROLE" \
-      aws iam delete-role --role-name "$IAM_ROLE"
+      aws_with_region iam delete-role --role-name "$IAM_ROLE"
   fi
 fi
 
-# 4. Delete Security Group (must wait for ENIs to release after instance termination)
-if [[ -n "$SG_ID" ]]; then
+# 4. Delete CloudWatch alarms and log groups
+if [[ ${#CW_ALARM_NAMES[@]} -gt 0 || -n "$CW_LOG_GROUP" ]]; then
   log ""
-  log "--- Step 4: Delete Security Group ---"
-  sleep 5  # ENI detach delay
-  verified_delete "Security Group: $SG_ID" "$SG_ID" \
-    aws ec2 delete-security-group --region "$REGION" --group-id "$SG_ID"
+  log "--- Step 4: Delete CloudWatch resources ---"
+  if [[ ${#CW_ALARM_NAMES[@]} -gt 0 ]]; then
+    aws_with_region cloudwatch delete-alarms --alarm-names "${CW_ALARM_NAMES[@]}" 2>/dev/null || true
+    log "  ✅ CloudWatch alarms deleted"
+  fi
+  if [[ -n "$CW_LOG_GROUP" ]]; then
+    delete_resource "CW Log Group: $CW_LOG_GROUP" \
+      aws_with_region logs delete-log-group --log-group-name "$CW_LOG_GROUP"
+  fi
 fi
 
-# 5. Delete Route Table (moved before subnet for cleaner dependency order)
+# 5. Delete Security Group (must wait for ENIs to release after instance termination)
+if [[ -n "$SG_ID" ]]; then
+  log ""
+  log "--- Step 5: Delete Security Group ---"
+  sleep 5  # ENI detach delay
+  verified_delete "Security Group: $SG_ID" "$SG_ID" \
+    aws_with_region ec2 delete-security-group --group-id "$SG_ID"
+fi
+
+# 6. Delete Route Table
 if [[ -n "$RTB_ID" ]]; then
   log ""
-  log "--- Step 5: Delete Route Table ---"
+  log "--- Step 6: Delete Route Table ---"
   if verify_tags "$RTB_ID" "$NAME" "$DEPLOY_ID"; then
     for assoc in $(aws_query ec2 describe-route-tables \
       --route-table-ids "$RTB_ID" \
       --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId'); do
-      aws ec2 disassociate-route-table --region "$REGION" --association-id "$assoc" 2>/dev/null || true
+      aws_with_region ec2 disassociate-route-table --association-id "$assoc" 2>/dev/null || true
     done
     delete_resource "Route Table: $RTB_ID" \
-      aws ec2 delete-route-table --region "$REGION" --route-table-id "$RTB_ID"
+      aws_with_region ec2 delete-route-table --route-table-id "$RTB_ID"
   else
     warn "  SKIPPED (tag mismatch): Route Table $RTB_ID"
     ERRORS=$((ERRORS + 1))
   fi
 fi
 
-# 6. Delete Subnet
+# 7. Delete Subnet
 if [[ -n "$SUBNET_ID" ]]; then
   log ""
-  log "--- Step 6: Delete Subnet ---"
+  log "--- Step 7: Delete Subnet ---"
   verified_delete "Subnet: $SUBNET_ID" "$SUBNET_ID" \
-    aws ec2 delete-subnet --region "$REGION" --subnet-id "$SUBNET_ID"
+    aws_with_region ec2 delete-subnet --subnet-id "$SUBNET_ID"
 fi
 
-# 7. Detach + Delete Internet Gateway
+# 8. Detach + Delete Internet Gateway
 if [[ -n "$IGW_ID" && -n "$VPC_ID" ]]; then
   log ""
-  log "--- Step 7: Delete Internet Gateway ---"
+  log "--- Step 8: Delete Internet Gateway ---"
   if verify_tags "$IGW_ID" "$NAME" "$DEPLOY_ID"; then
-    aws ec2 detach-internet-gateway --region "$REGION" \
+    aws_with_region ec2 detach-internet-gateway \
       --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID" 2>/dev/null || true
     delete_resource "Internet Gateway: $IGW_ID" \
-      aws ec2 delete-internet-gateway --region "$REGION" --internet-gateway-id "$IGW_ID"
+      aws_with_region ec2 delete-internet-gateway --internet-gateway-id "$IGW_ID"
   else
     warn "  SKIPPED (tag mismatch): IGW $IGW_ID"
     ERRORS=$((ERRORS + 1))
   fi
 fi
 
-# 8. Delete VPC (must be empty — all dependencies removed above)
+# 9. Delete VPC (must be empty — all dependencies removed above)
 if [[ -n "$VPC_ID" ]]; then
   log ""
-  log "--- Step 8: Delete VPC ---"
+  log "--- Step 9: Delete VPC ---"
   verified_delete "VPC: $VPC_ID" "$VPC_ID" \
-    aws ec2 delete-vpc --region "$REGION" --vpc-id "$VPC_ID"
+    aws_with_region ec2 delete-vpc --vpc-id "$VPC_ID"
 fi
 
 ###############################################################################

@@ -7,15 +7,21 @@ set -euo pipefail
 # Creates: VPC, subnet, IGW, route table, security group (no inbound),
 #          IAM role (SSM only), SSM parameters, EC2 t4g.medium (ARM64)
 #
+# AWS Authentication (in priority order):
+#   1. --profile <name>   — uses named AWS CLI profile
+#   2. .env.aws file      — loads AWS_ACCESS_KEY_ID/SECRET (if found)
+#   3. Environment/SSO    — uses existing AWS credentials (env vars, SSO, role)
+#
 # Prerequisites:
-#   - .env.aws   (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION)
 #   - .env.starfish (TELEGRAM_BOT_TOKEN, optionally GEMINI_API_KEY)
-#   Both files in the workspace root (parent of skill repo, or specified via --env-dir)
+#     In the workspace root (parent of skill repo, or specified via --env-dir)
 #
 # Usage:
 #   ./scripts/deploy_minimal.sh --name starfish --region us-east-1
+#   ./scripts/deploy_minimal.sh --name starfish --profile my-aws-profile
 #   ./scripts/deploy_minimal.sh --name starfish --region us-east-1 --env-dir /path/to/envs
 #   ./scripts/deploy_minimal.sh --name starfish --region us-east-1 --model amazon-bedrock/minimax.minimax-m2.1
+#   ./scripts/deploy_minimal.sh --name starfish --no-rollback --no-monitoring
 #
 # Lessons incorporated (issues #1-24):
 #   - t4g.medium (4GB) required — t4g.small OOMs during npm install + gateway startup
@@ -30,9 +36,17 @@ set -euo pipefail
 #   - auth-profiles.json for Gemini API key
 ###############################################################################
 
+# --- log() must be defined BEFORE personality resolution ---
+log() { echo "[$(date '+%H:%M:%S')] $*"; }
+warn() { echo "[$(date '+%H:%M:%S')] ⚠️  $*" >&2; }
+
 usage() {
   cat <<USAGE
 Usage: $0 [options]
+
+AWS Authentication (pick one):
+  --profile <name>        Use a named AWS CLI profile
+  (no flag)               Uses .env.aws if found, else existing env/SSO/role creds
 
 Options:
   --name <name>           Agent/project name (default: starfish)
@@ -55,6 +69,9 @@ Options:
                             amazon-bedrock/moonshotai.kimi-k2.5 (Kimi K2.5)
   --personality <name|path>  Agent personality: default, sentinel, researcher,
                           coder, companion — or path to custom SOUL.md
+  --az <zone>             Availability zone (e.g. us-east-1a). Auto-selects if not set.
+  --no-rollback           Don't auto-teardown on failure (for debugging)
+  --no-monitoring         Skip CloudWatch alarms and log shipping
   --dry-run               Show what would be created without creating
   --cleanup-first         Tear down existing resources with same name first
   -h, --help              Show this help
@@ -73,6 +90,10 @@ MODEL="google/gemini-2.0-flash"
 DRY_RUN=false
 CLEANUP_FIRST=false
 PERSONALITY="default"
+AWS_PROFILE_FLAG=""
+NO_ROLLBACK=false
+MONITORING=true
+AZ_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -85,6 +106,10 @@ while [[ $# -gt 0 ]]; do
     --output) OUTPUT_PATH="${2:-}"; shift 2 ;;
     --model) MODEL="${2:-}"; shift 2 ;;
     --personality) PERSONALITY="${2:-}"; shift 2 ;;
+    --profile) AWS_PROFILE_FLAG="${2:-}"; shift 2 ;;
+    --az) AZ_OVERRIDE="${2:-}"; shift 2 ;;
+    --no-rollback) NO_ROLLBACK=true; shift ;;
+    --no-monitoring) MONITORING=false; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     --cleanup-first) CLEANUP_FIRST=true; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -96,46 +121,77 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-if [[ -z "$ENV_DIR" ]]; then
-  # Look in workspace root first, then skill dir
-  if [[ -f "$SKILL_DIR/../.env.aws" ]]; then
-    ENV_DIR="$SKILL_DIR/.."
-  elif [[ -f "$SKILL_DIR/.env.aws" ]]; then
-    ENV_DIR="$SKILL_DIR"
-  else
-    echo "ERROR: Cannot find .env.aws. Provide --env-dir" >&2
-    exit 1
+###############################################################################
+# AWS Authentication Chain (P0 #1)
+# Priority: --profile > .env.aws > existing env/SSO/role
+###############################################################################
+
+# Build AWS CLI wrapper that includes --profile if specified
+if [[ -n "$AWS_PROFILE_FLAG" ]]; then
+  log "AWS auth: using profile '$AWS_PROFILE_FLAG'"
+  aws_cmd() { aws --region "$REGION" --profile "$AWS_PROFILE_FLAG" --output text "$@"; }
+  aws_json() { aws --region "$REGION" --profile "$AWS_PROFILE_FLAG" --output json "$@"; }
+  aws_raw() { aws --region "$REGION" --profile "$AWS_PROFILE_FLAG" "$@"; }
+else
+  # Try loading .env.aws if it exists (optional)
+  if [[ -z "$ENV_DIR" ]]; then
+    if [[ -f "$SKILL_DIR/../.env.aws" ]]; then
+      ENV_DIR="$SKILL_DIR/.."
+    elif [[ -f "$SKILL_DIR/.env.aws" ]]; then
+      ENV_DIR="$SKILL_DIR"
+    fi
   fi
+
+  if [[ -n "$ENV_DIR" ]]; then
+    ENV_DIR="$(cd "$ENV_DIR" && pwd)"
+  fi
+
+  if [[ -n "$ENV_DIR" && -f "$ENV_DIR/.env.aws" ]]; then
+    log "AWS auth: loading credentials from $ENV_DIR/.env.aws"
+    while IFS='=' read -r key value; do
+      export "$key=$value"
+    done < <(grep -E '^[A-Z0-9_]+=' "$ENV_DIR/.env.aws")
+  else
+    log "AWS auth: using existing environment/SSO/role credentials"
+  fi
+
+  export AWS_DEFAULT_REGION="$REGION"
+  aws_cmd() { aws --region "$REGION" --output text "$@"; }
+  aws_json() { aws --region "$REGION" --output json "$@"; }
+  aws_raw() { aws --region "$REGION" "$@"; }
 fi
 
-ENV_DIR="$(cd "$ENV_DIR" && pwd)"
-
-# Load credentials
-if [[ ! -f "$ENV_DIR/.env.aws" ]]; then
-  echo "ERROR: $ENV_DIR/.env.aws not found" >&2
+# Verify AWS credentials work (regardless of auth method)
+if ! aws_cmd sts get-caller-identity --query 'Account' >/dev/null 2>&1; then
+  echo "ERROR: AWS credentials not valid. Provide --profile, set up .env.aws, or configure AWS SSO/env." >&2
   exit 1
 fi
-if [[ ! -f "$ENV_DIR/.env.starfish" ]]; then
+
+# Find .env.starfish (still required)
+if [[ -z "$ENV_DIR" ]]; then
+  if [[ -f "$SKILL_DIR/../.env.starfish" ]]; then
+    ENV_DIR="$(cd "$SKILL_DIR/.." && pwd)"
+  elif [[ -f "$SKILL_DIR/.env.starfish" ]]; then
+    ENV_DIR="$(cd "$SKILL_DIR" && pwd)"
+  else
+    echo "ERROR: Cannot find .env.starfish. Provide --env-dir" >&2
+    exit 1
+  fi
+elif [[ ! -f "$ENV_DIR/.env.starfish" ]]; then
   echo "ERROR: $ENV_DIR/.env.starfish not found" >&2
   exit 1
 fi
 
-# Secure env parsing — only export strict KEY=VALUE lines (no arbitrary code execution)
-while IFS='=' read -r key value; do
-  export "$key=$value"
-done < <(grep -E '^[A-Z0-9_]+=' "$ENV_DIR/.env.aws")
+# Load starfish env
 while IFS='=' read -r key value; do
   export "$key=$value"
 done < <(grep -E '^[A-Z0-9_]+=' "$ENV_DIR/.env.starfish")
-export AWS_DEFAULT_REGION="$REGION"
 
-# Validate required vars
-for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY TELEGRAM_BOT_TOKEN; do
-  if [[ -z "${!var:-}" ]]; then
-    echo "ERROR: $var is not set" >&2
-    exit 1
-  fi
-done
+# Validate required vars (only Telegram token — AWS keys are no longer hard-required)
+if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+  echo "ERROR: TELEGRAM_BOT_TOKEN is not set (check .env.starfish)" >&2
+  exit 1
+fi
 
 # Check optional GEMINI_API_KEY
 HAS_GEMINI_KEY=false
@@ -146,11 +202,9 @@ fi
 # Resolve personality file
 PERSONALITIES_DIR="$SKILL_DIR/assets/personalities"
 if [[ -f "$PERSONALITY" ]]; then
-  # Custom path to SOUL.md
   SOUL_CONTENT=$(cat "$PERSONALITY")
   log "Personality: custom ($PERSONALITY)"
 elif [[ -f "$PERSONALITIES_DIR/${PERSONALITY}.md" ]]; then
-  # Built-in preset
   SOUL_CONTENT=$(cat "$PERSONALITIES_DIR/${PERSONALITY}.md")
   log "Personality: $PERSONALITY (built-in)"
 else
@@ -166,10 +220,6 @@ SOUL_B64=$(echo "$SOUL_CONTENT" | base64)
 # Generate a gateway token
 GATEWAY_TOKEN=$(openssl rand -hex 32)
 
-log() { echo "[$(date '+%H:%M:%S')] $*"; }
-aws_cmd() { aws --region "$REGION" --output text "$@"; }
-aws_json() { aws --region "$REGION" --output json "$@"; }
-
 TAG_KEY="Project"
 TAG_VALUE="$NAME"
 
@@ -179,20 +229,63 @@ DEPLOY_TAG_KEY="DeployId"
 
 log "Deploy ID: $DEPLOY_ID"
 
-# Trap: print cleanup instructions on failure
+###############################################################################
+# Failure trap — auto-rollback (P1 #6)
+###############################################################################
 cleanup_on_failure() {
   local exit_code=$?
   if [[ $exit_code -ne 0 ]]; then
     echo "" >&2
     echo "=========================================" >&2
     echo "  ❌ Deploy failed (exit code $exit_code)" >&2
-    echo "  Resources may have been partially created." >&2
-    echo "" >&2
-    echo "  To clean up, run:" >&2
-    echo "    $SCRIPT_DIR/teardown.sh --name $NAME --region $REGION --env-dir $ENV_DIR --yes" >&2
-    echo "" >&2
-    echo "  Or if deploy-output.json was written:" >&2
-    echo "    $SCRIPT_DIR/teardown.sh --from-output $OUTPUT_PATH --env-dir $ENV_DIR --yes" >&2
+    echo "=========================================" >&2
+
+    # Save partial output for diagnostics
+    if [[ -n "${VPC_ID:-}" || -n "${INSTANCE_ID:-}" ]]; then
+      log "Saving partial deploy-output.json for diagnostics..."
+      cat > "${OUTPUT_PATH}.partial" <<PARTEOF
+{
+  "name": "$NAME",
+  "region": "$REGION",
+  "deployId": "$DEPLOY_ID",
+  "partial": true,
+  "failedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "infrastructure": {
+    "vpcId": "${VPC_ID:-}",
+    "subnetId": "${SUBNET_ID:-}",
+    "igwId": "${IGW_ID:-}",
+    "routeTableId": "${RTB_ID:-}",
+    "securityGroupId": "${SG_ID:-}",
+    "iamRole": "${NAME}-role",
+    "instanceProfile": "${NAME}-instance-profile"
+  },
+  "instance": {
+    "instanceId": "${INSTANCE_ID:-}",
+    "instanceType": "$INSTANCE_TYPE"
+  }
+}
+PARTEOF
+      log "Partial output saved to: ${OUTPUT_PATH}.partial"
+    fi
+
+    if [[ "$NO_ROLLBACK" == "true" ]]; then
+      echo "  --no-rollback set. Resources left in place for debugging." >&2
+      echo "  To clean up manually:" >&2
+      echo "    $SCRIPT_DIR/teardown.sh --deploy-id $DEPLOY_ID --region $REGION --yes" >&2
+    else
+      echo "  Auto-rolling back (deploy-id: $DEPLOY_ID)..." >&2
+      if [[ -x "$SCRIPT_DIR/teardown.sh" ]]; then
+        # Scope teardown to this deploy only
+        "$SCRIPT_DIR/teardown.sh" --deploy-id "$DEPLOY_ID" --region "$REGION" \
+          ${ENV_DIR:+--env-dir "$ENV_DIR"} \
+          ${AWS_PROFILE_FLAG:+--profile "$AWS_PROFILE_FLAG"} \
+          --yes 2>&1 || warn "Auto-rollback encountered errors (see above)"
+        log "Auto-rollback complete. Check AWS console to verify."
+      else
+        echo "  teardown.sh not found — manual cleanup required:" >&2
+        echo "    $SCRIPT_DIR/teardown.sh --deploy-id $DEPLOY_ID --region $REGION --yes" >&2
+      fi
+    fi
     echo "=========================================" >&2
   fi
 }
@@ -202,11 +295,90 @@ log "=========================================="
 log "  OpenClaw Minimal Deploy: $NAME"
 log "  Region: $REGION | Instance: $INSTANCE_TYPE"
 log "  Model:  $MODEL"
+log "  Monitoring: $MONITORING"
 log "=========================================="
 
 # Verify AWS identity
 CALLER=$(aws_cmd sts get-caller-identity --query 'Account')
 log "AWS Account: $CALLER"
+
+###############################################################################
+# Preflight Validation (P1 #5)
+###############################################################################
+log ""
+log "--- Preflight Checks ---"
+
+# Check IAM permissions
+log "Checking IAM permissions..."
+PREFLIGHT_FAIL=false
+
+check_permission() {
+  local action="$1" resource="$2"
+  if ! aws_raw iam simulate-principal-policy \
+    --policy-source-arn "$(aws_cmd sts get-caller-identity --query 'Arn')" \
+    --action-names "$action" \
+    --resource-arns "$resource" \
+    --query 'EvaluationResults[0].EvalDecision' --output text 2>/dev/null | grep -q "allowed"; then
+    # simulate-principal-policy may fail if caller lacks iam:SimulatePrincipalPolicy
+    # In that case, we skip and let the actual API calls fail later
+    return 1
+  fi
+  return 0
+}
+
+# Try permission check (best-effort — iam:SimulatePrincipalPolicy may not be available)
+if aws_raw iam simulate-principal-policy \
+  --policy-source-arn "$(aws_cmd sts get-caller-identity --query 'Arn')" \
+  --action-names "ec2:CreateVpc" \
+  --resource-arns "*" \
+  --query 'EvaluationResults[0].EvalDecision' --output text 2>/dev/null | grep -q "allowed"; then
+  log "  ✅ ec2:CreateVpc — allowed"
+
+  for action in "ec2:RunInstances" "iam:CreateRole" "ssm:PutParameter"; do
+    if aws_raw iam simulate-principal-policy \
+      --policy-source-arn "$(aws_cmd sts get-caller-identity --query 'Arn')" \
+      --action-names "$action" \
+      --resource-arns "*" \
+      --query 'EvaluationResults[0].EvalDecision' --output text 2>/dev/null | grep -q "allowed"; then
+      log "  ✅ $action — allowed"
+    else
+      warn "  ❌ $action — denied or unknown"
+      PREFLIGHT_FAIL=true
+    fi
+  done
+else
+  log "  ⏭️  Permission simulation unavailable (iam:SimulatePrincipalPolicy not granted) — skipping"
+fi
+
+# Check instance type availability in region
+log "Checking instance type availability..."
+OFFERING=$(aws_cmd ec2 describe-instance-type-offerings \
+  --location-type availability-zone \
+  --filters "Name=instance-type,Values=$INSTANCE_TYPE" \
+  --query 'InstanceTypeOfferings[0].InstanceType' 2>/dev/null) || true
+if [[ -z "$OFFERING" ]]; then
+  warn "Instance type $INSTANCE_TYPE may not be available in $REGION"
+  PREFLIGHT_FAIL=true
+else
+  log "  ✅ $INSTANCE_TYPE available in $REGION"
+fi
+
+# Check if resources with same name already exist
+EXISTING_VPC=$(aws_cmd ec2 describe-vpcs \
+  --filters "Name=tag:Project,Values=$NAME" \
+  --query 'Vpcs[0].VpcId' 2>/dev/null) || true
+if [[ -n "$EXISTING_VPC" && "$EXISTING_VPC" != "None" && "$CLEANUP_FIRST" != "true" ]]; then
+  warn "Resources with Project=$NAME already exist (VPC: $EXISTING_VPC)"
+  warn "Use --cleanup-first to tear down first, or use a different --name"
+  PREFLIGHT_FAIL=true
+fi
+
+if [[ "$PREFLIGHT_FAIL" == "true" && "$DRY_RUN" != "true" ]]; then
+  echo "ERROR: Preflight checks failed. Fix issues above before deploying." >&2
+  exit 1
+fi
+
+log "Preflight checks passed ✅"
 
 if [[ "$DRY_RUN" == "true" ]]; then
   log "[DRY RUN] Would create: VPC, subnet, IGW, SG, IAM role, SSM params, EC2 instance"
@@ -221,11 +393,22 @@ if [[ "$CLEANUP_FIRST" == "true" ]]; then
   log ""
   log "--- Step 0: Cleaning up existing $NAME resources ---"
   if [[ -x "$SCRIPT_DIR/teardown.sh" ]]; then
-    "$SCRIPT_DIR/teardown.sh" --name "$NAME" --region "$REGION" --env-dir "$ENV_DIR" --yes || true
+    "$SCRIPT_DIR/teardown.sh" --name "$NAME" --region "$REGION" \
+      ${ENV_DIR:+--env-dir "$ENV_DIR"} \
+      ${AWS_PROFILE_FLAG:+--profile "$AWS_PROFILE_FLAG"} \
+      --yes || true
   else
     log "WARN: teardown.sh not executable, skipping cleanup"
   fi
 fi
+
+# Initialize resource tracking variables for rollback
+VPC_ID=""
+IGW_ID=""
+SUBNET_ID=""
+RTB_ID=""
+SG_ID=""
+INSTANCE_ID=""
 
 ###############################################################################
 # Step 1: VPC
@@ -239,8 +422,8 @@ VPC_ID=$(aws_cmd ec2 create-vpc \
 log "VPC: $VPC_ID"
 
 # Enable DNS
-aws ec2 modify-vpc-attribute --region "$REGION" --vpc-id "$VPC_ID" --enable-dns-support '{"Value":true}'
-aws ec2 modify-vpc-attribute --region "$REGION" --vpc-id "$VPC_ID" --enable-dns-hostnames '{"Value":true}'
+aws_raw ec2 modify-vpc-attribute --vpc-id "$VPC_ID" --enable-dns-support '{"Value":true}'
+aws_raw ec2 modify-vpc-attribute --vpc-id "$VPC_ID" --enable-dns-hostnames '{"Value":true}'
 
 ###############################################################################
 # Step 2: Internet Gateway
@@ -252,15 +435,24 @@ IGW_ID=$(aws_cmd ec2 create-internet-gateway \
   --query 'InternetGateway.InternetGatewayId')
 log "IGW: $IGW_ID"
 
-aws ec2 attach-internet-gateway --region "$REGION" --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID"
+aws_raw ec2 attach-internet-gateway --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID"
 
 ###############################################################################
-# Step 3: Subnet
+# Step 3: Subnet (P1 #9: AZ Selection)
 ###############################################################################
 log ""
 log "--- Step 3: Creating Subnet ---"
-# Pick first AZ
-AZ=$(aws_cmd ec2 describe-availability-zones --query 'AvailabilityZones[0].ZoneName')
+
+if [[ -n "$AZ_OVERRIDE" ]]; then
+  AZ="$AZ_OVERRIDE"
+  log "AZ: $AZ (user-specified)"
+else
+  # Get all AZs and try them in order if capacity errors occur
+  ALL_AZS=$(aws_cmd ec2 describe-availability-zones --query 'AvailabilityZones[*].ZoneName')
+  AZ=$(echo "$ALL_AZS" | awk '{print $1}')
+  log "AZ: $AZ (auto-selected, first available)"
+fi
+
 SUBNET_ID=$(aws_cmd ec2 create-subnet \
   --vpc-id "$VPC_ID" \
   --cidr-block "$SUBNET_CIDR" \
@@ -270,7 +462,7 @@ SUBNET_ID=$(aws_cmd ec2 create-subnet \
 log "Subnet: $SUBNET_ID ($AZ)"
 
 # Auto-assign public IPs
-aws ec2 modify-subnet-attribute --region "$REGION" --subnet-id "$SUBNET_ID" --map-public-ip-on-launch
+aws_raw ec2 modify-subnet-attribute --subnet-id "$SUBNET_ID" --map-public-ip-on-launch
 
 ###############################################################################
 # Step 4: Route Table
@@ -283,8 +475,8 @@ RTB_ID=$(aws_cmd ec2 create-route-table \
   --query 'RouteTable.RouteTableId')
 log "Route Table: $RTB_ID"
 
-aws ec2 create-route --region "$REGION" --route-table-id "$RTB_ID" --destination-cidr-block 0.0.0.0/0 --gateway-id "$IGW_ID" > /dev/null
-aws ec2 associate-route-table --region "$REGION" --route-table-id "$RTB_ID" --subnet-id "$SUBNET_ID" > /dev/null
+aws_raw ec2 create-route --route-table-id "$RTB_ID" --destination-cidr-block 0.0.0.0/0 --gateway-id "$IGW_ID" > /dev/null
+aws_raw ec2 associate-route-table --route-table-id "$RTB_ID" --subnet-id "$SUBNET_ID" > /dev/null
 
 ###############################################################################
 # Step 5: Security Group (NO inbound — SSM only)
@@ -300,7 +492,7 @@ SG_ID=$(aws_cmd ec2 create-security-group \
 log "Security Group: $SG_ID"
 
 ###############################################################################
-# Step 6: IAM Role (SSM + SSM Parameter Store)
+# Step 6: IAM Role (SSM + SSM Parameter Store + Bedrock + optional CloudWatch)
 ###############################################################################
 log ""
 log "--- Step 6: Creating IAM Role ---"
@@ -317,7 +509,7 @@ TRUST_POLICY='{
 }'
 
 # Create role (ignore error if exists)
-if aws iam create-role --region "$REGION" \
+if aws_raw iam create-role \
   --role-name "${NAME}-role" \
   --assume-role-policy-document "$TRUST_POLICY" \
   --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" > /dev/null 2>&1; then
@@ -327,7 +519,7 @@ else
 fi
 
 # Attach SSM managed policy
-aws iam attach-role-policy --role-name "${NAME}-role" \
+aws_raw iam attach-role-policy --role-name "${NAME}-role" \
   --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore 2>/dev/null || true
 
 # Add inline policy for SSM Parameter Store access
@@ -349,7 +541,7 @@ SSM_PARAM_POLICY=$(cat <<POLICY
 POLICY
 )
 
-aws iam put-role-policy --role-name "${NAME}-role" \
+aws_raw iam put-role-policy --role-name "${NAME}-role" \
   --policy-name SSMParameterAccess \
   --policy-document "$SSM_PARAM_POLICY"
 
@@ -374,20 +566,49 @@ BEDROCK_POLICY=$(cat <<BPOLICY
 }
 BPOLICY
 )
-aws iam put-role-policy --role-name "${NAME}-role" \
+aws_raw iam put-role-policy --role-name "${NAME}-role" \
   --policy-name BedrockAccess \
   --policy-document "$BEDROCK_POLICY"
 log "Added BedrockAccess inline policy"
 
+# Add CloudWatch permissions if monitoring enabled (P1 #7, #8)
+if [[ "$MONITORING" == "true" ]]; then
+  CW_POLICY=$(cat <<CWPOLICY
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricData",
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogStreams",
+        "logs:DescribeLogGroups",
+        "logs:PutRetentionPolicy"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+CWPOLICY
+)
+  aws_raw iam put-role-policy --role-name "${NAME}-role" \
+    --policy-name CloudWatchAccess \
+    --policy-document "$CW_POLICY"
+  log "Added CloudWatchAccess inline policy"
+fi
+
 # Create instance profile
-if aws iam create-instance-profile --instance-profile-name "${NAME}-instance-profile" > /dev/null 2>&1; then
+if aws_raw iam create-instance-profile --instance-profile-name "${NAME}-instance-profile" > /dev/null 2>&1; then
   log "Instance Profile: ${NAME}-instance-profile (created)"
 else
   log "Instance Profile: ${NAME}-instance-profile (already exists)"
 fi
 
 # Ensure role is attached (idempotent — ignore EntityAlreadyExists)
-aws iam add-role-to-instance-profile \
+aws_raw iam add-role-to-instance-profile \
   --instance-profile-name "${NAME}-instance-profile" \
   --role-name "${NAME}-role" 2>/dev/null || true
 
@@ -401,7 +622,7 @@ sleep 10
 log ""
 log "--- Step 7: Storing secrets in SSM Parameter Store ---"
 
-aws ssm put-parameter --region "$REGION" \
+aws_raw ssm put-parameter \
   --name "/${NAME}/telegram/bot_token" \
   --value "$TELEGRAM_BOT_TOKEN" \
   --type SecureString \
@@ -409,7 +630,7 @@ aws ssm put-parameter --region "$REGION" \
 log "Stored: /${NAME}/telegram/bot_token"
 
 if [[ "$HAS_GEMINI_KEY" == "true" ]]; then
-  aws ssm put-parameter --region "$REGION" \
+  aws_raw ssm put-parameter \
     --name "/${NAME}/gemini/api_key" \
     --value "$GEMINI_API_KEY" \
     --type SecureString \
@@ -419,7 +640,7 @@ else
   log "Skipped: /${NAME}/gemini/api_key (not provided)"
 fi
 
-aws ssm put-parameter --region "$REGION" \
+aws_raw ssm put-parameter \
   --name "/${NAME}/gateway/token" \
   --value "$GATEWAY_TOKEN" \
   --type SecureString \
@@ -444,6 +665,45 @@ log "--- Step 9: Generating user-data ---"
 
 # Node version — OpenClaw 2026.x requires ≥22.12.0
 NODE_VERSION="22.14.0"
+
+# Build CloudWatch agent config snippet for user-data (P1 #8)
+if [[ "$MONITORING" == "true" ]]; then
+  CW_AGENT_SETUP='
+# Install and configure CloudWatch agent for log shipping
+echo "[$(date)] Installing CloudWatch agent..."
+retry_cmd dnf install -y amazon-cloudwatch-agent || true
+
+if command -v amazon-cloudwatch-agent-ctl &>/dev/null; then
+  echo "[$(date)] Configuring CloudWatch agent..."
+  mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+  cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWEOF
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/openclaw-bootstrap.log",
+            "log_group_name": "/openclaw/__NAME__",
+            "log_stream_name": "{instance_id}/bootstrap",
+            "retention_in_days": 7
+          }
+        ]
+      }
+    }
+  }
+}
+CWEOF
+  sed -i "s/__NAME__/'"$AGENT_NAME"'/g" /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+  amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json || true
+  echo "[$(date)] CloudWatch agent started"
+else
+  echo "[$(date)] WARN: CloudWatch agent not available — skipping log shipping"
+fi
+'
+else
+  CW_AGENT_SETUP='# CloudWatch agent disabled (--no-monitoring)'
+fi
 
 USER_DATA=$(cat <<'USERDATA'
 #!/bin/bash
@@ -483,6 +743,8 @@ retry_cmd() {
 echo "[$(date)] Installing dependencies..."
 retry_cmd dnf install -y git jq tar gzip
 
+__CW_AGENT_SETUP__
+
 # Install Node.js from official tarball (NodeSource unreliable on AL2023 ARM64)
 echo "[$(date)] Installing Node.js ${NODE_VERSION}..."
 cd /tmp
@@ -521,16 +783,38 @@ useradd -r -m -s /bin/bash openclaw || true
 mkdir -p /home/openclaw/.openclaw/agents/main/agent
 mkdir -p /home/openclaw/.openclaw/workspace
 
-# Retrieve secrets from SSM
-echo "[$(date)] Retrieving secrets from SSM..."
-TELEGRAM_TOKEN=$(aws ssm get-parameter --region "$REGION" --name "/${AGENT_NAME}/telegram/bot_token" --with-decryption --query 'Parameter.Value' --output text)
-if [[ "$HAS_GEMINI_KEY" == "true" ]]; then
-  GEMINI_KEY=$(aws ssm get-parameter --region "$REGION" --name "/${AGENT_NAME}/gemini/api_key" --with-decryption --query 'Parameter.Value' --output text)
-fi
-GW_TOKEN=$(aws ssm get-parameter --region "$REGION" --name "/${AGENT_NAME}/gateway/token" --with-decryption --query 'Parameter.Value' --output text)
+# Create startup script (P0 #2: Secrets at Rest — fetches from SSM at each start)
+echo "[$(date)] Writing startup script..."
+cat > /usr/local/bin/openclaw-startup.sh <<'STARTEOF'
+#!/bin/bash
+set -e
 
-# Create OpenClaw config
-echo "[$(date)] Writing openclaw.json..."
+export HOME="/home/openclaw"
+export PATH="/usr/local/bin:/usr/bin:$PATH"
+export NODE_OPTIONS="--max-old-space-size=1024"
+export AWS_DEFAULT_REGION="__REGION__"
+export AWS_REGION="__REGION__"
+
+AGENT_NAME="__NAME__"
+MODEL="__MODEL__"
+HAS_GEMINI_KEY="__HAS_GEMINI_KEY__"
+
+cd /home/openclaw/.openclaw
+
+echo "[$(date)] Fetching secrets from SSM Parameter Store..."
+
+# Fetch secrets from SSM at runtime (secrets never persisted on disk)
+TELEGRAM_TOKEN=$(aws ssm get-parameter --region "$AWS_REGION" --name "/${AGENT_NAME}/telegram/bot_token" --with-decryption --query 'Parameter.Value' --output text)
+GW_TOKEN=$(aws ssm get-parameter --region "$AWS_REGION" --name "/${AGENT_NAME}/gateway/token" --with-decryption --query 'Parameter.Value' --output text)
+
+GEMINI_KEY=""
+if [[ "$HAS_GEMINI_KEY" == "true" ]]; then
+  GEMINI_KEY=$(aws ssm get-parameter --region "$AWS_REGION" --name "/${AGENT_NAME}/gemini/api_key" --with-decryption --query 'Parameter.Value' --output text)
+fi
+
+echo "[$(date)] Writing ephemeral config files..."
+
+# Write openclaw.json (overwritten each start — ephemeral)
 cat > /home/openclaw/.openclaw/openclaw.json <<OCEOF
 {
   "gateway": {
@@ -586,9 +870,8 @@ cat > /home/openclaw/.openclaw/openclaw.json <<OCEOF
 }
 OCEOF
 
-# Create auth profiles
-echo "[$(date)] Writing auth-profiles.json..."
-if [[ "$HAS_GEMINI_KEY" == "true" ]]; then
+# Write auth-profiles.json (overwritten each start — ephemeral)
+if [[ "$HAS_GEMINI_KEY" == "true" && -n "$GEMINI_KEY" ]]; then
   cat > /home/openclaw/.openclaw/agents/main/agent/auth-profiles.json <<APEOF
 {
   "version": 1,
@@ -602,7 +885,6 @@ if [[ "$HAS_GEMINI_KEY" == "true" ]]; then
 }
 APEOF
 else
-  # No Gemini key — Bedrock/other providers use IAM or external auth
   cat > /home/openclaw/.openclaw/agents/main/agent/auth-profiles.json <<APEOF
 {
   "version": 1,
@@ -611,19 +893,10 @@ else
 APEOF
 fi
 
-# Create startup script
-echo "[$(date)] Writing startup script..."
-cat > /usr/local/bin/openclaw-startup.sh <<'STARTEOF'
-#!/bin/bash
-set -e
+# Ensure ownership
+chown -R openclaw:openclaw /home/openclaw/.openclaw
 
-export HOME="/home/openclaw"
-export PATH="/usr/local/bin:/usr/bin:$PATH"
-export NODE_OPTIONS="--max-old-space-size=1024"
-export AWS_DEFAULT_REGION="__REGION__"
-export AWS_REGION="__REGION__"
-
-cd /home/openclaw/.openclaw
+echo "[$(date)] Starting gateway..."
 
 # Start gateway in FOREGROUND mode
 # CRITICAL: Use 'run' not 'start' — start tries systemctl --user which fails
@@ -631,6 +904,12 @@ exec /usr/local/bin/openclaw gateway run --allow-unconfigured
 STARTEOF
 chmod +x /usr/local/bin/openclaw-startup.sh
 sed -i "s/__REGION__/${REGION}/g" /usr/local/bin/openclaw-startup.sh
+sed -i "s/__NAME__/${NAME}/g" /usr/local/bin/openclaw-startup.sh
+sed -i "s/__HAS_GEMINI_KEY__/${HAS_GEMINI_KEY}/g" /usr/local/bin/openclaw-startup.sh
+
+# Escape model string for sed (handle slashes)
+MODEL_SED_ESCAPED=$(echo "$MODEL" | sed 's/[\/&]/\\&/g')
+sed -i "s/__MODEL__/${MODEL_SED_ESCAPED}/g" /usr/local/bin/openclaw-startup.sh
 
 # Create systemd service (simplified — security hardening removed due to namespace issues)
 echo "[$(date)] Writing systemd service..."
@@ -699,36 +978,139 @@ USER_DATA="${USER_DATA//__NODE_VERSION__/$NODE_VERSION}"
 USER_DATA="${USER_DATA//__MODEL__/$MODEL_ESCAPED}"
 USER_DATA="${USER_DATA//__HAS_GEMINI_KEY__/$HAS_GEMINI_KEY}"
 USER_DATA="${USER_DATA//__SOUL_B64__/$SOUL_B64}"
+USER_DATA="${USER_DATA//__CW_AGENT_SETUP__/$CW_AGENT_SETUP}"
 
 # Base64 encode
 USER_DATA_B64=$(echo "$USER_DATA" | base64)
 
 ###############################################################################
-# Step 10: Launch EC2 Instance
+# Step 10: Launch EC2 Instance (P1 #9: AZ retry)
 ###############################################################################
 log ""
 log "--- Step 10: Launching EC2 Instance ---"
 
-INSTANCE_ID=$(aws_cmd ec2 run-instances \
-  --image-id "$AMI_ID" \
-  --instance-type "$INSTANCE_TYPE" \
-  --subnet-id "$SUBNET_ID" \
-  --security-group-ids "$SG_ID" \
-  --iam-instance-profile "Name=${NAME}-instance-profile" \
-  --user-data "$USER_DATA_B64" \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME}},{Key=$TAG_KEY,Value=$TAG_VALUE},{Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID}]" \
-  --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
-  --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":20,"VolumeType":"gp3","Encrypted":true}}]' \
-  --query 'Instances[0].InstanceId')
-log "Instance: $INSTANCE_ID"
+launch_instance() {
+  local az="$1"
+  aws_cmd ec2 run-instances \
+    --image-id "$AMI_ID" \
+    --instance-type "$INSTANCE_TYPE" \
+    --subnet-id "$SUBNET_ID" \
+    --security-group-ids "$SG_ID" \
+    --iam-instance-profile "Name=${NAME}-instance-profile" \
+    --user-data "$USER_DATA_B64" \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${NAME}},{Key=$TAG_KEY,Value=$TAG_VALUE},{Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID}]" \
+    --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+    --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":20,"VolumeType":"gp3","Encrypted":true}}]' \
+    --query 'Instances[0].InstanceId' 2>&1
+}
+
+# Try launching — if InsufficientInstanceCapacity and no AZ was forced, try other AZs
+INSTANCE_ID=""
+LAUNCH_OUTPUT=$(launch_instance "$AZ" 2>&1) || true
+
+if [[ "$LAUNCH_OUTPUT" == i-* ]]; then
+  INSTANCE_ID="$LAUNCH_OUTPUT"
+elif [[ -z "$AZ_OVERRIDE" ]] && echo "$LAUNCH_OUTPUT" | grep -qi "InsufficientInstanceCapacity\|Unsupported"; then
+  log "Capacity issue in $AZ, trying other AZs..."
+  for fallback_az in $ALL_AZS; do
+    [[ "$fallback_az" == "$AZ" ]] && continue
+    log "Trying AZ: $fallback_az..."
+    # Need new subnet in this AZ — recreate
+    aws_raw ec2 delete-subnet --subnet-id "$SUBNET_ID" 2>/dev/null || true
+    SUBNET_ID=$(aws_cmd ec2 create-subnet \
+      --vpc-id "$VPC_ID" \
+      --cidr-block "$SUBNET_CIDR" \
+      --availability-zone "$fallback_az" \
+      --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${NAME}-subnet},{Key=$TAG_KEY,Value=$TAG_VALUE},{Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID}]" \
+      --query 'Subnet.SubnetId')
+    aws_raw ec2 modify-subnet-attribute --subnet-id "$SUBNET_ID" --map-public-ip-on-launch
+    # Re-associate route table
+    aws_raw ec2 associate-route-table --route-table-id "$RTB_ID" --subnet-id "$SUBNET_ID" > /dev/null
+
+    LAUNCH_OUTPUT=$(launch_instance "$fallback_az" 2>&1) || true
+    if [[ "$LAUNCH_OUTPUT" == i-* ]]; then
+      INSTANCE_ID="$LAUNCH_OUTPUT"
+      AZ="$fallback_az"
+      log "Launched in AZ: $AZ"
+      break
+    fi
+  done
+fi
+
+if [[ -z "$INSTANCE_ID" ]]; then
+  echo "ERROR: Failed to launch instance: $LAUNCH_OUTPUT" >&2
+  exit 1
+fi
+
+log "Instance: $INSTANCE_ID (AZ: $AZ)"
 
 log "Waiting for instance to be running..."
-aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
+aws_raw ec2 wait instance-running --instance-ids "$INSTANCE_ID"
 
 PUBLIC_IP=$(aws_cmd ec2 describe-instances \
   --instance-ids "$INSTANCE_ID" \
   --query 'Reservations[0].Instances[0].PublicIpAddress')
 log "Public IP: $PUBLIC_IP"
+
+###############################################################################
+# Step 10b: CloudWatch Alarms (P1 #7)
+###############################################################################
+ALARM_ARNS=()
+
+if [[ "$MONITORING" == "true" ]]; then
+  log ""
+  log "--- Step 10b: Creating CloudWatch Alarms ---"
+
+  # StatusCheckFailed alarm
+  STATUS_ALARM_NAME="${NAME}-status-check-failed"
+  aws_raw cloudwatch put-metric-alarm \
+    --alarm-name "$STATUS_ALARM_NAME" \
+    --alarm-description "OpenClaw ${NAME}: instance status check failed" \
+    --namespace AWS/EC2 \
+    --metric-name StatusCheckFailed \
+    --dimensions "Name=InstanceId,Value=$INSTANCE_ID" \
+    --statistic Maximum \
+    --period 300 \
+    --evaluation-periods 1 \
+    --threshold 1 \
+    --comparison-operator GreaterThanOrEqualToThreshold \
+    --treat-missing-data breaching \
+    --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" 2>/dev/null || true
+  STATUS_ALARM_ARN=$(aws_cmd cloudwatch describe-alarms \
+    --alarm-names "$STATUS_ALARM_NAME" \
+    --query 'MetricAlarms[0].AlarmArn' 2>/dev/null) || true
+  [[ -n "$STATUS_ALARM_ARN" && "$STATUS_ALARM_ARN" != "None" ]] && ALARM_ARNS+=("$STATUS_ALARM_ARN")
+  log "  ✅ StatusCheckFailed alarm: $STATUS_ALARM_NAME"
+
+  # CPUUtilization > 90% for 5 min
+  CPU_ALARM_NAME="${NAME}-cpu-high"
+  aws_raw cloudwatch put-metric-alarm \
+    --alarm-name "$CPU_ALARM_NAME" \
+    --alarm-description "OpenClaw ${NAME}: CPU > 90% for 5 min" \
+    --namespace AWS/EC2 \
+    --metric-name CPUUtilization \
+    --dimensions "Name=InstanceId,Value=$INSTANCE_ID" \
+    --statistic Average \
+    --period 300 \
+    --evaluation-periods 1 \
+    --threshold 90 \
+    --comparison-operator GreaterThanThreshold \
+    --treat-missing-data missing \
+    --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" 2>/dev/null || true
+  CPU_ALARM_ARN=$(aws_cmd cloudwatch describe-alarms \
+    --alarm-names "$CPU_ALARM_NAME" \
+    --query 'MetricAlarms[0].AlarmArn' 2>/dev/null) || true
+  [[ -n "$CPU_ALARM_ARN" && "$CPU_ALARM_ARN" != "None" ]] && ALARM_ARNS+=("$CPU_ALARM_ARN")
+  log "  ✅ CPUUtilization alarm: $CPU_ALARM_NAME"
+
+  # Set up CloudWatch log group with retention (P1 #8)
+  log "Creating CloudWatch log group..."
+  aws_raw logs create-log-group --log-group-name "/openclaw/${NAME}" \
+    --tags "$TAG_KEY=$TAG_VALUE,$DEPLOY_TAG_KEY=$DEPLOY_ID" 2>/dev/null || true
+  aws_raw logs put-retention-policy --log-group-name "/openclaw/${NAME}" \
+    --retention-in-days 7 2>/dev/null || true
+  log "  ✅ Log group: /openclaw/${NAME} (7 day retention)"
+fi
 
 ###############################################################################
 # Step 11: Wait for SSM + bootstrap to complete
@@ -739,7 +1121,7 @@ log "This takes 4-6 minutes for Node.js + OpenClaw install..."
 
 # Wait for SSM to be available
 for i in $(seq 1 30); do
-  if aws ssm describe-instance-information --region "$REGION" \
+  if aws_raw ssm describe-instance-information \
     --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
     --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null | grep -q "Online"; then
     log "SSM agent is online (attempt $i)"
@@ -754,7 +1136,7 @@ done
 # Wait for bootstrap to finish (check for the log file marker)
 log "Waiting for bootstrap to complete..."
 for i in $(seq 1 48); do
-  RESULT=$(aws ssm send-command --region "$REGION" \
+  RESULT=$(aws_raw ssm send-command \
     --instance-ids "$INSTANCE_ID" \
     --document-name "AWS-RunShellScript" \
     --parameters 'commands=["grep -c \"Bootstrap complete\" /var/log/openclaw-bootstrap.log 2>/dev/null || echo 0"]' \
@@ -762,7 +1144,7 @@ for i in $(seq 1 48); do
 
   if [[ -n "$RESULT" ]]; then
     sleep 5
-    STATUS=$(aws ssm get-command-invocation --region "$REGION" \
+    STATUS=$(aws_raw ssm get-command-invocation \
       --command-id "$RESULT" --instance-id "$INSTANCE_ID" \
       --query 'StandardOutputContent' --output text 2>/dev/null) || true
     if [[ "$STATUS" == *"1"* ]]; then
@@ -785,7 +1167,7 @@ log ""
 log "--- Step 12: Smoke Test ---"
 
 SMOKE_CMD='systemctl is-active openclaw && echo "SERVICE_OK"; journalctl -u openclaw -n 5 --no-pager'
-SMOKE_ID=$(aws ssm send-command --region "$REGION" \
+SMOKE_ID=$(aws_raw ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
   --parameters "commands=[\"$SMOKE_CMD\"]" \
@@ -793,7 +1175,7 @@ SMOKE_ID=$(aws ssm send-command --region "$REGION" \
 
 if [[ -n "$SMOKE_ID" ]]; then
   sleep 10
-  SMOKE_OUT=$(aws ssm get-command-invocation --region "$REGION" \
+  SMOKE_OUT=$(aws_raw ssm get-command-invocation \
     --command-id "$SMOKE_ID" --instance-id "$INSTANCE_ID" \
     --query 'StandardOutputContent' --output text 2>/dev/null) || true
   log "Smoke test output:"
@@ -812,6 +1194,17 @@ if [[ "$HAS_GEMINI_KEY" == "true" ]]; then
     \"/${NAME}/gemini/api_key\""
 else
   GEMINI_SSM_JSON_ENTRY=""
+fi
+
+# Build alarm ARNs JSON array
+ALARM_JSON="[]"
+if [[ ${#ALARM_ARNS[@]} -gt 0 ]]; then
+  ALARM_JSON="["
+  for i in "${!ALARM_ARNS[@]}"; do
+    [[ $i -gt 0 ]] && ALARM_JSON+=","
+    ALARM_JSON+="\"${ALARM_ARNS[$i]}\""
+  done
+  ALARM_JSON+="]"
 fi
 
 cat > "$OUTPUT_PATH" <<OUTEOF
@@ -834,12 +1227,18 @@ cat > "$OUTPUT_PATH" <<OUTEOF
     "instanceId": "$INSTANCE_ID",
     "instanceType": "$INSTANCE_TYPE",
     "amiId": "$AMI_ID",
-    "publicIp": "$PUBLIC_IP"
+    "publicIp": "$PUBLIC_IP",
+    "availabilityZone": "$AZ"
   },
   "ssmParameters": [
     "/${NAME}/telegram/bot_token",
     "/${NAME}/gateway/token"${GEMINI_SSM_JSON_ENTRY}
   ],
+  "monitoring": {
+    "enabled": $MONITORING,
+    "alarmArns": $ALARM_JSON,
+    "logGroup": "/openclaw/${NAME}"
+  },
   "config": {
     "model": "$MODEL",
     "channel": "telegram",
@@ -861,6 +1260,7 @@ log "=========================================="
 log ""
 log "  Instance:  $INSTANCE_ID"
 log "  Public IP: $PUBLIC_IP"
+log "  AZ:        $AZ"
 log "  Model:     $MODEL"
 log "  Channel:   Telegram (@${NAME} bot)"
 log ""
