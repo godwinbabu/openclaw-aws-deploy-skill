@@ -18,7 +18,6 @@ set -euo pipefail
 #   - --dry-run shows what would be deleted without deleting
 #   - Tag verification before each EC2 resource deletion (fails closed)
 #   - Ambiguity detection: --name mode fails if multiple DeployIds found
-#   - --force flag to bypass multi-deploy safety check
 #   - Fail loudly on real API errors (not-found is non-fatal)
 #   - Confirmation prompt unless --yes is passed
 #

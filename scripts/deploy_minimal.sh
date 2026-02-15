@@ -1114,9 +1114,9 @@ USER_DATA_B64=$(echo "$USER_DATA" | base64)
 if [[ "$IS_BEDROCK" == "true" ]]; then
   log ""
   log "--- Step 9b: Checking Bedrock model access ---"
-  MODEL_AVAIL=$(aws bedrock get-foundation-model-availability \
-    --model-id "$BEDROCK_MODEL_ID" --region "$REGION" \
-    --query 'authorizationStatus' --output text 2>/dev/null || echo "UNKNOWN")
+  MODEL_AVAIL=$(aws_cmd bedrock get-foundation-model-availability \
+    --model-id "$BEDROCK_MODEL_ID" \
+    --query 'authorizationStatus' 2>/dev/null || echo "UNKNOWN")
   if [[ "$MODEL_AVAIL" == "AUTHORIZED" ]]; then
     log "✅ Bedrock model $BEDROCK_MODEL_ID is authorized"
   else
