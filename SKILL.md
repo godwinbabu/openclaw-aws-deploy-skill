@@ -13,15 +13,18 @@ metadata:
 
 # OpenClaw AWS Deploy Skill
 
-## Quick Start (Minimal Deployment ~$25/mo)
+## Quick Start (Minimal Deployment ~$30/mo)
 
 ### Prerequisites
-- `.env.aws` in workspace root (recommended) or skill directory:
-  ```
-  AWS_ACCESS_KEY_ID=...
-  AWS_SECRET_ACCESS_KEY=...
-  AWS_DEFAULT_REGION=us-east-1
-  ```
+- **AWS credentials** — any of these methods:
+  - `--profile <name>` flag (named AWS CLI profile)
+  - `.env.aws` file in workspace root or skill directory (optional):
+    ```
+    AWS_ACCESS_KEY_ID=...
+    AWS_SECRET_ACCESS_KEY=...
+    AWS_DEFAULT_REGION=us-east-1
+    ```
+  - Existing environment variables, AWS SSO session, or IAM role
 - `.env.starfish` in workspace root (recommended) or skill directory:
   ```
   TELEGRAM_BOT_TOKEN=...     # from @BotFather (required)
@@ -46,7 +49,7 @@ This single command:
 1. Creates VPC + subnet + IGW + route table
 2. Creates security group (NO inbound ports — SSM only)
 3. Creates IAM role with minimal permissions (SSM + Parameter Store + Bedrock)
-4. Stores secrets in SSM Parameter Store (sourced at bootstrap, persisted on-instance in OpenClaw config files)
+4. Stores secrets in SSM Parameter Store (fetched at each service start — rewritten on each start, never stored in repo or static images)
 5. Launches **t4g.medium** ARM64 instance with user-data bootstrap
 6. User-data installs Node.js 22 + OpenClaw + configures everything
 7. Runs smoke test via SSM
@@ -175,7 +178,7 @@ These are baked into the deploy script. See `references/TROUBLESHOOTING.md` for 
 
 ### Security
 - **No inbound ports** — SSM Session Manager only
-- **Secrets sourced from SSM Parameter Store** — sourced at bootstrap, then persisted on-instance in OpenClaw config files (never in git)
+- **Secrets fetched from SSM at runtime** — startup script fetches secrets each time the service starts; config files are ephemeral (rewritten on each start, never stored in repo or static images)
 - **Encrypted EBS** — enabled by default in deploy script
 - **IMDSv2 required** — `HttpTokens=required`
 
@@ -185,11 +188,6 @@ These are baked into the deploy script. See `references/TROUBLESHOOTING.md` for 
 scripts/
   deploy_minimal.sh    # One-shot deploy (VPC + EC2 + OpenClaw)
   teardown.sh          # Clean teardown of all resources
-  preflight.sh         # Validate AWS creds + prerequisites
-  smoke_test.sh        # Post-deploy validation
-  deploy_infra.sh      # CloudFormation-based (advanced)
-  bootstrap_host.sh    # SSM-based host bootstrap (advanced)
-  configure_openclaw.sh # SSM-based config push (advanced)
 
 references/
   TROUBLESHOOTING.md   # All 24 issues + solutions
@@ -211,7 +209,7 @@ Create at `~/.openclaw/agents/main/agent/auth-profiles.json`
 ### Systemd Service (openclaw.service)
 Simplified for reliability — security hardening removed due to namespace issues.
 
-## Cost Breakdown (~$25/mo)
+## Cost Breakdown (~$30/mo)
 | Resource | Cost |
 |----------|------|
 | t4g.medium (4GB ARM64) | ~$24.53/mo |
