@@ -28,6 +28,7 @@ metadata:
 - `.env.starfish` in workspace root (recommended) or skill directory:
   ```
   TELEGRAM_BOT_TOKEN=...     # from @BotFather (required)
+  TELEGRAM_USER_ID=...       # your Telegram user ID (optional, enables auto-approve pairing)
   GEMINI_API_KEY=...         # from aistudio.google.com (optional, for Gemini models)
   ```
 - `aws` CLI installed OR Docker for sandboxed access
@@ -84,12 +85,12 @@ This single command:
 Pass any model string — it goes directly into `openclaw.json` as `model.primary`:
 
 ```bash
-# Default (Gemini Flash — needs GEMINI_API_KEY in .env.starfish)
+# Default (MiniMax M2.1 on Bedrock — no API key needed, uses IAM role)
 ./scripts/deploy_minimal.sh --name starfish --region us-east-1
 
-# Bedrock model (no API key needed — uses IAM role)
+# Gemini Flash (needs GEMINI_API_KEY in .env.starfish)
 ./scripts/deploy_minimal.sh --name starfish --region us-east-1 \
-  --model amazon-bedrock/minimax.minimax-m2.1
+  --model google/gemini-2.0-flash
 ```
 
 ### AWS Bedrock
@@ -217,6 +218,36 @@ Simplified for reliability — security hardening removed due to namespace issue
 | Public IP | ~$3.65/mo |
 | Gemini Flash | Free tier / ~$0.30/1M tokens |
 | **Total** | **~$29.78/mo** |
+
+## Troubleshooting
+
+### "No API key found for amazon-bedrock"
+
+**Cause:** OpenClaw needs `models.providers` config in `openclaw.json` with `"auth": "aws-sdk"`. An `auth-profiles.json` entry alone is NOT sufficient.
+
+**Fix:** Add to `openclaw.json` on the instance:
+```bash
+sudo -u openclaw bash
+cd /home/openclaw/.openclaw
+jq '.models = {
+  "providers": {"amazon-bedrock": {"baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com", "api": "bedrock-converse-stream", "auth": "aws-sdk", "models": [{"id": "minimax.minimax-m2.1", "name": "MiniMax M2.1", "input": ["text"], "contextWindow": 128000, "maxTokens": 4096}]}},
+  "bedrockDiscovery": {"enabled": true, "region": "us-east-1"}
+}' openclaw.json > /tmp/oc.json && mv /tmp/oc.json openclaw.json
+chown openclaw:openclaw openclaw.json
+systemctl restart openclaw
+```
+
+### "API rate limit reached" (Gemini)
+
+**Fix:** Switch to Bedrock (default in current version) or redeploy with `--model amazon-bedrock/minimax.minimax-m2.1`.
+
+### Bedrock model returns errors
+
+**Cause:** Model must be enabled in AWS Console → Bedrock → Model access. MiniMax models are auto-authorized; Anthropic/Meta models require use-case approval.
+
+### Bot doesn't respond after deploy
+
+**Fix:** Add `TELEGRAM_USER_ID` to `.env.starfish` for auto-pairing, or use `--pair-user <id>`. Manual: `openclaw pairing approve telegram <CODE>` via SSM.
 
 ## Safety Rules
 - Never print secrets in logs

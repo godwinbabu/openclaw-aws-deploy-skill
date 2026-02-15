@@ -106,7 +106,7 @@ INSTANCE_TYPE="t4g.medium"
 VPC_CIDR="10.50.0.0/16"
 SUBNET_CIDR="10.50.0.0/24"
 OUTPUT_PATH="./deploy-output.json"
-MODEL="google/gemini-2.0-flash"
+MODEL="amazon-bedrock/minimax.minimax-m2.1"
 DRY_RUN=false
 CLEANUP_FIRST=false
 PERSONALITY="default"
@@ -245,6 +245,15 @@ if [[ -n "${GEMINI_API_KEY:-}" ]]; then
   HAS_GEMINI_KEY=true
 fi
 
+# Determine if model is Bedrock and extract model ID
+IS_BEDROCK=false
+BEDROCK_MODEL_ID=""
+if [[ "$MODEL" == amazon-bedrock/* ]]; then
+  IS_BEDROCK=true
+  BEDROCK_MODEL_ID="${MODEL#amazon-bedrock/}"
+  log "Bedrock model detected: $BEDROCK_MODEL_ID"
+fi
+
 # Resolve personality file
 PERSONALITIES_DIR="$SKILL_DIR/assets/personalities"
 if [[ -f "$PERSONALITY" ]]; then
@@ -262,6 +271,12 @@ fi
 
 # Base64-encode SOUL.md for safe transport in user-data
 SOUL_B64=$(echo "$SOUL_CONTENT" | base64)
+
+# Base64-encode agent default files
+AGENT_DEFAULTS_DIR="$SKILL_DIR/assets/agent-defaults"
+AGENTS_MD_B64=$(cat "$AGENT_DEFAULTS_DIR/AGENTS.md" | base64)
+HEARTBEAT_MD_B64=$(cat "$AGENT_DEFAULTS_DIR/HEARTBEAT.md" | base64)
+USER_MD_B64=$(cat "$AGENT_DEFAULTS_DIR/USER.md" | base64)
 
 # Generate a gateway token
 GATEWAY_TOKEN=$(openssl rand -hex 32)
@@ -910,6 +925,7 @@ cat > /home/openclaw/.openclaw/openclaw.json <<OCEOF
       }
     }
   },
+  __MODELS_BLOCK__
   "tools": {
     "agentToAgent": {
       "enabled": true
@@ -918,12 +934,17 @@ cat > /home/openclaw/.openclaw/openclaw.json <<OCEOF
 }
 OCEOF
 
-# Write auth-profiles.json (overwritten each start — ephemeral)
+# Write auth-profiles.json (always include Bedrock for IAM-based access)
 if [[ "$HAS_GEMINI_KEY" == "true" && -n "$GEMINI_KEY" ]]; then
   cat > /home/openclaw/.openclaw/agents/main/agent/auth-profiles.json <<APEOF
 {
   "version": 1,
   "profiles": {
+    "amazon-bedrock:default": {
+      "type": "aws",
+      "provider": "amazon-bedrock",
+      "awsRegion": "${REGION}"
+    },
     "google:default": {
       "type": "token",
       "provider": "google",
@@ -936,7 +957,13 @@ else
   cat > /home/openclaw/.openclaw/agents/main/agent/auth-profiles.json <<APEOF
 {
   "version": 1,
-  "profiles": {}
+  "profiles": {
+    "amazon-bedrock:default": {
+      "type": "aws",
+      "provider": "amazon-bedrock",
+      "awsRegion": "${REGION}"
+    }
+  }
 }
 APEOF
 fi
@@ -989,6 +1016,13 @@ SVCEOF
 # Write SOUL.md (personality) to workspace
 echo "[$(date)] Writing SOUL.md (personality)..."
 echo "__SOUL_B64__" | base64 -d > /home/openclaw/.openclaw/workspace/SOUL.md
+cp /home/openclaw/.openclaw/workspace/SOUL.md /home/openclaw/.openclaw/agents/main/agent/SOUL.md
+
+echo "[$(date)] Writing agent default files (AGENTS.md, HEARTBEAT.md, USER.md)..."
+echo "__AGENTS_MD_B64__" | base64 -d > /home/openclaw/.openclaw/workspace/AGENTS.md
+echo "__HEARTBEAT_MD_B64__" | base64 -d > /home/openclaw/.openclaw/workspace/HEARTBEAT.md
+echo "__USER_MD_B64__" | base64 -d > /home/openclaw/.openclaw/workspace/USER.md
+mkdir -p /home/openclaw/.openclaw/workspace/memory
 
 # Fix ownership
 chown -R openclaw:openclaw /home/openclaw/.openclaw
@@ -1021,17 +1055,77 @@ if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
 fi
 MODEL_ESCAPED="$MODEL"
 
+# Generate models config block based on provider
+if [[ "$IS_BEDROCK" == "true" ]]; then
+  MODELS_BLOCK=$(cat <<MEOF
+"models": {
+    "providers": {
+      "amazon-bedrock": {
+        "baseUrl": "https://bedrock-runtime.${REGION}.amazonaws.com",
+        "api": "bedrock-converse-stream",
+        "auth": "aws-sdk",
+        "models": [
+          {
+            "id": "${BEDROCK_MODEL_ID}",
+            "name": "${BEDROCK_MODEL_ID}",
+            "input": ["text"],
+            "contextWindow": 128000,
+            "maxTokens": 4096
+          }
+        ]
+      }
+    },
+    "bedrockDiscovery": {
+      "enabled": true,
+      "region": "${REGION}"
+    }
+  },
+MEOF
+)
+else
+  MODELS_BLOCK=$(cat <<'MEOF'
+"models": {
+    "bedrockDiscovery": {
+      "enabled": false
+    }
+  },
+MEOF
+)
+fi
+
 # Replace placeholders
 USER_DATA="${USER_DATA//__NAME__/$NAME}"
 USER_DATA="${USER_DATA//__REGION__/$REGION}"
 USER_DATA="${USER_DATA//__NODE_VERSION__/$NODE_VERSION}"
 USER_DATA="${USER_DATA//__MODEL__/$MODEL_ESCAPED}"
 USER_DATA="${USER_DATA//__HAS_GEMINI_KEY__/$HAS_GEMINI_KEY}"
+USER_DATA="${USER_DATA//__MODELS_BLOCK__/$MODELS_BLOCK}"
 USER_DATA="${USER_DATA//__SOUL_B64__/$SOUL_B64}"
+USER_DATA="${USER_DATA//__AGENTS_MD_B64__/$AGENTS_MD_B64}"
+USER_DATA="${USER_DATA//__HEARTBEAT_MD_B64__/$HEARTBEAT_MD_B64}"
+USER_DATA="${USER_DATA//__USER_MD_B64__/$USER_MD_B64}"
 USER_DATA="${USER_DATA//__CW_AGENT_SETUP__/$CW_AGENT_SETUP}"
 
 # Base64 encode
 USER_DATA_B64=$(echo "$USER_DATA" | base64)
+
+###############################################################################
+# Step 9b: Verify Bedrock model access (if using Bedrock)
+if [[ "$IS_BEDROCK" == "true" ]]; then
+  log ""
+  log "--- Step 9b: Checking Bedrock model access ---"
+  MODEL_AVAIL=$(aws bedrock get-foundation-model-availability \
+    --model-id "$BEDROCK_MODEL_ID" --region "$REGION" \
+    --query 'authorizationStatus' --output text 2>/dev/null || echo "UNKNOWN")
+  if [[ "$MODEL_AVAIL" == "AUTHORIZED" ]]; then
+    log "✅ Bedrock model $BEDROCK_MODEL_ID is authorized"
+  else
+    log "⚠️  Bedrock model $BEDROCK_MODEL_ID status: $MODEL_AVAIL"
+    log "    You may need to enable it in the AWS Bedrock Console:"
+    log "    https://console.aws.amazon.com/bedrock/home?region=${REGION}#/modelaccess"
+    log "    Continuing deployment — model may fail until enabled."
+  fi
+fi
 
 ###############################################################################
 # Step 10: Launch EC2 Instance (P1 #9: AZ retry)
