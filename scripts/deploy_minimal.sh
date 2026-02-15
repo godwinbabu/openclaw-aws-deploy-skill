@@ -600,9 +600,11 @@ BEDROCK_POLICY=$(cat <<BPOLICY
       "Effect": "Allow",
       "Action": [
         "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream"
+        "bedrock:InvokeModelWithResponseStream",
+        "bedrock:ListFoundationModels"
       ],
       "Resource": [
+        "*",
         "arn:aws:bedrock:${REGION}::foundation-model/*",
         "arn:aws:bedrock:${REGION}:*:inference-profile/*",
         "arn:aws:bedrock:${REGION}:*:application-inference-profile/*"
@@ -946,6 +948,9 @@ echo "[$(date)] Starting gateway..."
 
 # Start gateway in FOREGROUND mode
 # CRITICAL: Use 'run' not 'start' — start tries systemctl --user which fails
+# AWS_PROFILE=default tells OpenClaw to use the AWS SDK default credential chain (IMDS/instance role)
+# Must be set AFTER SSM calls above (which use IMDS directly without a profile)
+export AWS_PROFILE=default
 exec /usr/local/bin/openclaw gateway run --allow-unconfigured
 STARTEOF
 chmod +x /usr/local/bin/openclaw-startup.sh
