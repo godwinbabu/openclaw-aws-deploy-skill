@@ -950,7 +950,7 @@ exec /usr/local/bin/openclaw gateway run --allow-unconfigured
 STARTEOF
 chmod +x /usr/local/bin/openclaw-startup.sh
 sed -i "s/__REGION__/${REGION}/g" /usr/local/bin/openclaw-startup.sh
-sed -i "s/__NAME__/${NAME}/g" /usr/local/bin/openclaw-startup.sh
+sed -i "s/__NAME__/${AGENT_NAME}/g" /usr/local/bin/openclaw-startup.sh
 sed -i "s/__HAS_GEMINI_KEY__/${HAS_GEMINI_KEY}/g" /usr/local/bin/openclaw-startup.sh
 
 # Escape model string for sed (handle slashes)
