@@ -187,8 +187,11 @@ These are baked into the deploy script. See `references/TROUBLESHOOTING.md` for 
 
 ```
 scripts/
-  deploy_minimal.sh    # One-shot deploy (VPC + EC2 + OpenClaw)
-  teardown.sh          # Clean teardown of all resources
+  deploy_minimal.sh        # One-shot deploy (VPC + EC2 + OpenClaw)
+  teardown.sh              # Clean teardown of all resources
+  setup_deployer_role.sh   # Create IAM role/user with minimum permissions
+  preflight.sh             # Pre-deploy validation checks
+  smoke_test.sh            # Post-deploy health verification
 
 references/
   TROUBLESHOOTING.md   # All 24 issues + solutions

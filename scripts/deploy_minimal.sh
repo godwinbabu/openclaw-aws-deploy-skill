@@ -139,6 +139,17 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# --- Input validation ---
+if ! [[ "$NAME" =~ ^[a-zA-Z][a-zA-Z0-9-]{0,30}$ ]]; then
+  echo "ERROR: --name must be 1-31 alphanumeric/hyphen chars starting with a letter" >&2
+  exit 1
+fi
+
+if [[ -n "$PAIR_USER" ]] && ! [[ "$PAIR_USER" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: --pair-user must be a numeric Telegram user ID" >&2
+  exit 1
+fi
+
 # Resolve paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -1106,8 +1117,8 @@ USER_DATA="${USER_DATA//__HEARTBEAT_MD_B64__/$HEARTBEAT_MD_B64}"
 USER_DATA="${USER_DATA//__USER_MD_B64__/$USER_MD_B64}"
 USER_DATA="${USER_DATA//__CW_AGENT_SETUP__/$CW_AGENT_SETUP}"
 
-# Base64 encode
-USER_DATA_B64=$(echo "$USER_DATA" | base64)
+# Gzip + Base64 encode (cloud-init auto-detects gzip; avoids 16KB user-data limit)
+USER_DATA_B64=$(echo "$USER_DATA" | gzip -9 | base64)
 
 ###############################################################################
 # Step 9b: Verify Bedrock model access (if using Bedrock)

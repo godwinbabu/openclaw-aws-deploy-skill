@@ -10,10 +10,10 @@ Common issues encountered during OpenClaw AWS deployment and their solutions.
 FATAL ERROR: Reached heap limit Allocation failed
 ```
 
-**Solution:** Upgrade to t4g.small (2GB RAM minimum)
+**Solution:** Upgrade to t4g.medium (4GB RAM minimum — t4g.small OOMs during npm install + gateway startup)
 ```bash
 aws ec2 stop-instances --instance-ids $INSTANCE_ID
-aws ec2 modify-instance-attribute --instance-id $INSTANCE_ID --instance-type t4g.small
+aws ec2 modify-instance-attribute --instance-id $INSTANCE_ID --instance-type t4g.medium
 aws ec2 start-instances --instance-ids $INSTANCE_ID
 ```
 
