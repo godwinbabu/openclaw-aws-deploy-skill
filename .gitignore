@@ -1,10 +1,12 @@
 # Credentials (NEVER commit)
+.env
 .env.*
 *.env
 
 # Deploy outputs (contain resource IDs)
 deploy-output.json
 *-output.json
+*.partial
 
 # OS
 .DS_Store

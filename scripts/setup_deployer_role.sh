@@ -167,7 +167,9 @@ DEPLOYER_POLICY=$(cat <<POLICY
         "iam:RemoveRoleFromInstanceProfile",
         "iam:PassRole",
         "iam:SimulatePrincipalPolicy",
-        "iam:ListRoleTags"
+        "iam:ListRoleTags",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies"
       ],
       "Resource": [
         "arn:aws:iam::${ACCOUNT_ID}:role/*-role",

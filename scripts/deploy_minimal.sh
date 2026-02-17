@@ -58,13 +58,13 @@ Options:
   --vpc-cidr <cidr>       VPC CIDR (default: 10.50.0.0/16)
   --subnet-cidr <cidr>    Subnet CIDR (default: 10.50.0.0/24)
   --output <path>         Output JSON file (default: ./deploy-output.json)
-  --model <model>         AI model (default: google/gemini-2.0-flash)
+  --model <model>         AI model (default: amazon-bedrock/minimax.minimax-m2.1)
                           Any model string — passed directly to openclaw.json.
                           Bedrock models use IAM role auth (no API key needed).
                           If GEMINI_API_KEY is in .env.starfish, Gemini auth is set up.
                           Examples:
-                            google/gemini-2.0-flash             (default, needs GEMINI_API_KEY)
-                            amazon-bedrock/minimax.minimax-m2.1 (MiniMax M2.1)
+                            amazon-bedrock/minimax.minimax-m2.1 (default, no API key needed)
+                            google/gemini-2.0-flash             (needs GEMINI_API_KEY)
                             amazon-bedrock/minimax.minimax-m2   (MiniMax M2)
                             amazon-bedrock/deepseek.deepseek-r1 (DeepSeek R1)
                             amazon-bedrock/moonshotai.kimi-k2.5 (Kimi K2.5)
@@ -138,6 +138,47 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown arg: $1"; usage; exit 2 ;;
   esac
 done
+
+# --- Input validation ---
+if ! [[ "$NAME" =~ ^[a-zA-Z][a-zA-Z0-9-]{0,30}$ ]]; then
+  echo "ERROR: --name must be 1-31 alphanumeric/hyphen chars starting with a letter" >&2
+  exit 1
+fi
+
+if [[ -n "$PAIR_USER" ]] && ! [[ "$PAIR_USER" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: --pair-user must be a numeric Telegram user ID" >&2
+  exit 1
+fi
+
+if ! [[ "$REGION" =~ ^[a-z]{2}-[a-z]+-[0-9]+$ ]]; then
+  echo "ERROR: --region must be a valid AWS region (e.g. us-east-1)" >&2
+  exit 1
+fi
+
+if ! [[ "$INSTANCE_TYPE" =~ ^[a-z][0-9][a-z]?\.[a-z0-9]+$ ]]; then
+  echo "ERROR: --instance-type must be a valid EC2 instance type (e.g. t4g.medium)" >&2
+  exit 1
+fi
+
+if ! [[ "$VPC_CIDR" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+  echo "ERROR: --vpc-cidr must be a valid CIDR block (e.g. 10.50.0.0/16)" >&2
+  exit 1
+fi
+
+if ! [[ "$SUBNET_CIDR" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+  echo "ERROR: --subnet-cidr must be a valid CIDR block (e.g. 10.50.0.0/24)" >&2
+  exit 1
+fi
+
+if [[ -n "$AZ_OVERRIDE" ]] && ! [[ "$AZ_OVERRIDE" =~ ^[a-z]{2}-[a-z]+-[0-9]+[a-z]$ ]]; then
+  echo "ERROR: --az must be a valid availability zone (e.g. us-east-1a)" >&2
+  exit 1
+fi
+
+if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
+  echo "ERROR: --model contains invalid characters" >&2
+  exit 1
+fi
 
 # Resolve paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -943,7 +984,7 @@ if [[ "$HAS_GEMINI_KEY" == "true" && -n "$GEMINI_KEY" ]]; then
     "amazon-bedrock:default": {
       "type": "aws",
       "provider": "amazon-bedrock",
-      "awsRegion": "${REGION}"
+      "awsRegion": "${AWS_REGION}"
     },
     "google:default": {
       "type": "token",
@@ -961,7 +1002,7 @@ else
     "amazon-bedrock:default": {
       "type": "aws",
       "provider": "amazon-bedrock",
-      "awsRegion": "${REGION}"
+      "awsRegion": "${AWS_REGION}"
     }
   }
 }
@@ -1048,11 +1089,7 @@ echo "[$(date)] Bootstrap complete!"
 USERDATA
 )
 
-# Validate MODEL — must be a simple model string (no control chars, quotes, or newlines)
-if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
-  echo "ERROR: --model contains invalid characters (allowed: A-Za-z0-9._:/-)" >&2
-  exit 1
-fi
+# MODEL already validated in input validation section above
 MODEL_ESCAPED="$MODEL"
 
 # Generate models config block based on provider
@@ -1106,8 +1143,8 @@ USER_DATA="${USER_DATA//__HEARTBEAT_MD_B64__/$HEARTBEAT_MD_B64}"
 USER_DATA="${USER_DATA//__USER_MD_B64__/$USER_MD_B64}"
 USER_DATA="${USER_DATA//__CW_AGENT_SETUP__/$CW_AGENT_SETUP}"
 
-# Base64 encode
-USER_DATA_B64=$(echo "$USER_DATA" | base64)
+# Gzip + Base64 encode (cloud-init auto-detects gzip; avoids 16KB user-data limit)
+USER_DATA_B64=$(echo "$USER_DATA" | gzip -9 | base64)
 
 ###############################################################################
 # Step 9b: Verify Bedrock model access (if using Bedrock)
@@ -1207,7 +1244,7 @@ if [[ "$MONITORING" == "true" ]]; then
 
   # StatusCheckFailed alarm
   STATUS_ALARM_NAME="${NAME}-status-check-failed"
-  aws_raw cloudwatch put-metric-alarm \
+  if aws_raw cloudwatch put-metric-alarm \
     --alarm-name "$STATUS_ALARM_NAME" \
     --alarm-description "OpenClaw ${NAME}: instance status check failed" \
     --namespace AWS/EC2 \
@@ -1219,8 +1256,7 @@ if [[ "$MONITORING" == "true" ]]; then
     --threshold 1 \
     --comparison-operator GreaterThanOrEqualToThreshold \
     --treat-missing-data breaching \
-    --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" 2>/dev/null
-  if [[ $? -eq 0 ]]; then
+    --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" 2>/dev/null; then
     STATUS_ALARM_ARN=$(aws_cmd cloudwatch describe-alarms \
       --alarm-names "$STATUS_ALARM_NAME" \
       --query 'MetricAlarms[0].AlarmArn' 2>/dev/null) || true
@@ -1232,7 +1268,7 @@ if [[ "$MONITORING" == "true" ]]; then
 
   # CPUUtilization > 90% for 5 min
   CPU_ALARM_NAME="${NAME}-cpu-high"
-  aws_raw cloudwatch put-metric-alarm \
+  if aws_raw cloudwatch put-metric-alarm \
     --alarm-name "$CPU_ALARM_NAME" \
     --alarm-description "OpenClaw ${NAME}: CPU > 90% for 5 min" \
     --namespace AWS/EC2 \
@@ -1244,8 +1280,7 @@ if [[ "$MONITORING" == "true" ]]; then
     --threshold 90 \
     --comparison-operator GreaterThanThreshold \
     --treat-missing-data missing \
-    --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" 2>/dev/null
-  if [[ $? -eq 0 ]]; then
+    --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" 2>/dev/null; then
     CPU_ALARM_ARN=$(aws_cmd cloudwatch describe-alarms \
       --alarm-names "$CPU_ALARM_NAME" \
       --query 'MetricAlarms[0].AlarmArn' 2>/dev/null) || true

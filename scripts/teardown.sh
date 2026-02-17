@@ -210,14 +210,14 @@ verify_tags() {
   fi
 
   if [[ -n "$expected_project" ]]; then
-    if ! echo "$tags" | grep -q "Project.*$expected_project"; then
+    if ! echo "$tags" | grep -Fq "$expected_project"; then
       warn "Tag mismatch on $resource_id: expected Project=$expected_project"
       return 1
     fi
   fi
 
   if [[ -n "$expected_deploy_id" ]]; then
-    if ! echo "$tags" | grep -q "DeployId.*$expected_deploy_id"; then
+    if ! echo "$tags" | grep -Fq "$expected_deploy_id"; then
       warn "Tag mismatch on $resource_id: expected DeployId=$expected_deploy_id"
       return 1
     fi

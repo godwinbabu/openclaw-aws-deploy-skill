@@ -140,7 +140,7 @@ GEMINI_API_KEY=...         # Optional — from aistudio.google.com (needed for G
     SSM (no SSH/inbound)      Outbound HTTPS only
 ```
 
-## Critical Lessons Learned (24 Issues)
+## Critical Lessons Learned (22 Issues)
 
 These are baked into the deploy script. See `references/TROUBLESHOOTING.md` for full details.
 
@@ -187,15 +187,18 @@ These are baked into the deploy script. See `references/TROUBLESHOOTING.md` for 
 
 ```
 scripts/
-  deploy_minimal.sh    # One-shot deploy (VPC + EC2 + OpenClaw)
-  teardown.sh          # Clean teardown of all resources
+  deploy_minimal.sh        # One-shot deploy (VPC + EC2 + OpenClaw)
+  teardown.sh              # Clean teardown of all resources
+  setup_deployer_role.sh   # Create IAM role/user with minimum permissions
+  preflight.sh             # Pre-deploy validation checks
+  smoke_test.sh            # Post-deploy health verification
 
 references/
-  TROUBLESHOOTING.md   # All 24 issues + solutions
+  TROUBLESHOOTING.md   # All 22 issues + solutions
   config-templates/    # Ready-to-use config files
     gemini-flash.json  # OpenClaw config for Gemini Flash
     auth-profiles-gemini.json  # Auth profile template
-    openclaw.service   # Systemd unit file
+    openclaw.service.txt  # Systemd unit file template
     startup.sh         # Startup script template
 ```
 
