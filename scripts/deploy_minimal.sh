@@ -984,7 +984,7 @@ if [[ "$HAS_GEMINI_KEY" == "true" && -n "$GEMINI_KEY" ]]; then
     "amazon-bedrock:default": {
       "type": "aws",
       "provider": "amazon-bedrock",
-      "awsRegion": "${REGION}"
+      "awsRegion": "${AWS_REGION}"
     },
     "google:default": {
       "type": "token",
@@ -1002,7 +1002,7 @@ else
     "amazon-bedrock:default": {
       "type": "aws",
       "provider": "amazon-bedrock",
-      "awsRegion": "${REGION}"
+      "awsRegion": "${AWS_REGION}"
     }
   }
 }
@@ -1244,7 +1244,7 @@ if [[ "$MONITORING" == "true" ]]; then
 
   # StatusCheckFailed alarm
   STATUS_ALARM_NAME="${NAME}-status-check-failed"
-  aws_raw cloudwatch put-metric-alarm \
+  if aws_raw cloudwatch put-metric-alarm \
     --alarm-name "$STATUS_ALARM_NAME" \
     --alarm-description "OpenClaw ${NAME}: instance status check failed" \
     --namespace AWS/EC2 \
@@ -1256,8 +1256,7 @@ if [[ "$MONITORING" == "true" ]]; then
     --threshold 1 \
     --comparison-operator GreaterThanOrEqualToThreshold \
     --treat-missing-data breaching \
-    --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" 2>/dev/null
-  if [[ $? -eq 0 ]]; then
+    --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" 2>/dev/null; then
     STATUS_ALARM_ARN=$(aws_cmd cloudwatch describe-alarms \
       --alarm-names "$STATUS_ALARM_NAME" \
       --query 'MetricAlarms[0].AlarmArn' 2>/dev/null) || true
@@ -1269,7 +1268,7 @@ if [[ "$MONITORING" == "true" ]]; then
 
   # CPUUtilization > 90% for 5 min
   CPU_ALARM_NAME="${NAME}-cpu-high"
-  aws_raw cloudwatch put-metric-alarm \
+  if aws_raw cloudwatch put-metric-alarm \
     --alarm-name "$CPU_ALARM_NAME" \
     --alarm-description "OpenClaw ${NAME}: CPU > 90% for 5 min" \
     --namespace AWS/EC2 \
@@ -1281,8 +1280,7 @@ if [[ "$MONITORING" == "true" ]]; then
     --threshold 90 \
     --comparison-operator GreaterThanThreshold \
     --treat-missing-data missing \
-    --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" 2>/dev/null
-  if [[ $? -eq 0 ]]; then
+    --tags "Key=$TAG_KEY,Value=$TAG_VALUE" "Key=$DEPLOY_TAG_KEY,Value=$DEPLOY_ID" 2>/dev/null; then
     CPU_ALARM_ARN=$(aws_cmd cloudwatch describe-alarms \
       --alarm-names "$CPU_ALARM_NAME" \
       --query 'MetricAlarms[0].AlarmArn' 2>/dev/null) || true
