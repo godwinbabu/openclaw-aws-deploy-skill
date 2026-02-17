@@ -2,7 +2,7 @@
 
 **One-shot OpenClaw deployment to AWS** — VPC, EC2, Telegram, any AI model, all in one command.
 
-[![ClawHub](https://img.shields.io/badge/ClawHub-openclaw--aws--deploy-blue)](https://clawhub.com)
+[![ClawHub](https://img.shields.io/badge/ClawHub-openclaw--aws--deploy-blue)](https://clawhub.ai/skills/openclaw-aws-deploy)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## What It Does
@@ -217,7 +217,7 @@ scripts/
 assets/personalities/      ← Agent personality presets (SOUL.md files)
 
 references/
-  TROUBLESHOOTING.md       ← 26 documented issues + solutions
+  TROUBLESHOOTING.md       ← 22 documented issues + solutions
   config-templates/        ← OpenClaw config, systemd, auth templates
 ```
 
@@ -231,7 +231,7 @@ references/
 
 ## Lessons Learned
 
-This skill encodes **26 documented issues** discovered during real deployments. Every fix is baked into the scripts. See [`references/TROUBLESHOOTING.md`](references/TROUBLESHOOTING.md).
+This skill encodes **22 documented issues** discovered during real deployments. Every fix is baked into the scripts. See [`references/TROUBLESHOOTING.md`](references/TROUBLESHOOTING.md).
 
 ## Contributing
 

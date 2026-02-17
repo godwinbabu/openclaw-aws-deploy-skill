@@ -58,13 +58,13 @@ Options:
   --vpc-cidr <cidr>       VPC CIDR (default: 10.50.0.0/16)
   --subnet-cidr <cidr>    Subnet CIDR (default: 10.50.0.0/24)
   --output <path>         Output JSON file (default: ./deploy-output.json)
-  --model <model>         AI model (default: google/gemini-2.0-flash)
+  --model <model>         AI model (default: amazon-bedrock/minimax.minimax-m2.1)
                           Any model string — passed directly to openclaw.json.
                           Bedrock models use IAM role auth (no API key needed).
                           If GEMINI_API_KEY is in .env.starfish, Gemini auth is set up.
                           Examples:
-                            google/gemini-2.0-flash             (default, needs GEMINI_API_KEY)
-                            amazon-bedrock/minimax.minimax-m2.1 (MiniMax M2.1)
+                            amazon-bedrock/minimax.minimax-m2.1 (default, no API key needed)
+                            google/gemini-2.0-flash             (needs GEMINI_API_KEY)
                             amazon-bedrock/minimax.minimax-m2   (MiniMax M2)
                             amazon-bedrock/deepseek.deepseek-r1 (DeepSeek R1)
                             amazon-bedrock/moonshotai.kimi-k2.5 (Kimi K2.5)
@@ -147,6 +147,36 @@ fi
 
 if [[ -n "$PAIR_USER" ]] && ! [[ "$PAIR_USER" =~ ^[0-9]+$ ]]; then
   echo "ERROR: --pair-user must be a numeric Telegram user ID" >&2
+  exit 1
+fi
+
+if ! [[ "$REGION" =~ ^[a-z]{2}-[a-z]+-[0-9]+$ ]]; then
+  echo "ERROR: --region must be a valid AWS region (e.g. us-east-1)" >&2
+  exit 1
+fi
+
+if ! [[ "$INSTANCE_TYPE" =~ ^[a-z][0-9][a-z]?\.[a-z0-9]+$ ]]; then
+  echo "ERROR: --instance-type must be a valid EC2 instance type (e.g. t4g.medium)" >&2
+  exit 1
+fi
+
+if ! [[ "$VPC_CIDR" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+  echo "ERROR: --vpc-cidr must be a valid CIDR block (e.g. 10.50.0.0/16)" >&2
+  exit 1
+fi
+
+if ! [[ "$SUBNET_CIDR" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+  echo "ERROR: --subnet-cidr must be a valid CIDR block (e.g. 10.50.0.0/24)" >&2
+  exit 1
+fi
+
+if [[ -n "$AZ_OVERRIDE" ]] && ! [[ "$AZ_OVERRIDE" =~ ^[a-z]{2}-[a-z]+-[0-9]+[a-z]$ ]]; then
+  echo "ERROR: --az must be a valid availability zone (e.g. us-east-1a)" >&2
+  exit 1
+fi
+
+if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
+  echo "ERROR: --model contains invalid characters" >&2
   exit 1
 fi
 
@@ -1059,11 +1089,7 @@ echo "[$(date)] Bootstrap complete!"
 USERDATA
 )
 
-# Validate MODEL — must be a simple model string (no control chars, quotes, or newlines)
-if ! [[ "$MODEL" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
-  echo "ERROR: --model contains invalid characters (allowed: A-Za-z0-9._:/-)" >&2
-  exit 1
-fi
+# MODEL already validated in input validation section above
 MODEL_ESCAPED="$MODEL"
 
 # Generate models config block based on provider
